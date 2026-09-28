@@ -1,0 +1,34 @@
+{
+  "capture": {
+    "notes": "editor PIE session, protocol 7, 51 event types",
+    "sha256": "50E7FF09857B36292336D42AA93DB2219BBBF68DF5F94E705A121B5EEF69F954",
+    "size": 35495101
+  },
+  "facts": {
+    "events_stream_packets": 2,
+    "importants_stream_packets": 2491,
+    "magic": "2CRT",
+    "packet_anomalies": 0,
+    "packets": 163600,
+    "packets_lz4": 24767,
+    "packets_raw": 138830,
+    "packets_sync": 3,
+    "payload_bytes": 49857025,
+    "protocol": 7,
+    "schema_records": 51,
+    "schema_redefinitions": 0,
+    "schema_types": 51,
+    "size": 35495101,
+    "stream_anomalies": 0,
+    "threads_with_packets": 104,
+    "tids": 107,
+    "top_tid_packets": {
+      "2": 16567,
+      "4": 13870,
+      "5": 13789,
+      "6": 13732,
+      "95": 15579
+    },
+    "transport": 4
+  }
+}

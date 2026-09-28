@@ -25,11 +25,21 @@ The rest of the file is a flat sequence of packets, each `[uint16 PacketSize][ui
   +uint64 serial — not expected in normal captures).
 * Special thread ids: `0` = **Events** (the schema stream), `1` = **Importants** (the
   important-event cache, re-broadcast on every connect), `2`..`0x3ff0` = real threads
-  (`Bias` = 2), `0x3ffe` = PseudoImportants, `0x3fff` = **Sync** (sync points; 3 in the corpus).
+  (`Bias` = 2), `0x3ffe` = **PseudoImportants** (the on-connect thread enumeration — thread
+  names and groups — carried in *thread* framing rather than record framing), `0x3fff` =
+  **Sync** (sync points; 3 in the corpus).
 * Packets > 384 bytes and ≤ 4 KB (the writer's block size) *may* be LZ4-encoded. Corpus:
   138,830 raw + 24,767 encoded; average packet 217 bytes, max 3,756.
 * A packet's decoded bytes are appended to that thread's byte stream; events never straddle
   packets.
+* The decoder is **the C library** (`LZ4_decompress_safe`, from LZ4 v1.9.2 vendored under
+  `src/cpp/third_party/lz4`), loaded with `ctypes` from `bin/ueia_lz4.dll` — the root
+  `CMakeLists.txt` builds it — or, failing that, from a system library (`$UEI_LZ4_DLL` names one
+  explicitly). The tool ships no decoder of its own, on purpose: one decoder means one answer,
+  and a packet decoded by anything laxer is one every command downstream would read as fact.
+  `ueia lz4` reports the state, `ueia lz4 --build` compiles it when it is missing or stale, and
+  `tools/stamp_lz4.cmake` writes `bin/ueia_lz4.build.json` from the build itself, so "current" is
+  a comparison of the recipe's SHA-256s — not of timestamps, which say nothing about what changed.
 
 ## 3. Per-thread event streams
 
@@ -45,13 +55,32 @@ The rest of the file is a flat sequence of packets, each `[uint16 PacketSize][ui
   bound how long to wait. NoSync events carry none.
 * **Aux data**: strings and arrays are not inline — they follow the event's fixed payload as
   `FAuxHeader` blocks (`[uid byte][field-index/size][uint16 size]` + bytes), ended by an
-  `AuxDataTerminal` byte, for events the schema marks MaybeHasAux.
+  `AuxDataTerminal` byte, for events the schema marks MaybeHasAux. A long string or array is
+  written as **several segments, each with its own header and the same field index** (the
+  writer splits at buffer boundaries) — a reader that takes only the last segment holds a
+  truncated value, which is exactly how a CPU batch blob loses its final varint.
 * **Important events** (the Events/Importants streams) use `[uint16 Uid][uint16 Size]` headers —
   self-contained sizes, because the important cache is replayed ahead of normal events on
-  connect.
+  connect — and they frame their aux blocks **differently from thread streams**: the uid bytes
+  are unshifted (`1` = AuxData, `3` = terminal) and a terminal follows *every* aux field, not
+  one list. A "wide" string there is written one byte per character (the writer truncates each
+  character), not UTF-16.
+* **Scope markers**: `EnterScope`/`LeaveScope` are one byte; a timestamped marker
+  (`EnterScope_TA`/`_TB` and their leaving twins) is **eight bytes in total** — the writer packs
+  `(cycles << 8) | uid << 1` into one uint64, so the uid byte is the *first* of the eight and a
+  reader that takes eight payload bytes past it walks out of step (which is what stopped 38
+  streams early on the corpus's first parse).
 * **Timers**: `EnterScope`/`LeaveScope` bytes bracket the event that names the timer; the CPU
   profiler's timer specs (`FCpuProfilerTrace::OutputEventType(Name, File, Line)`) are important
-  events that carry **name + source file + line** — source locations are in the trace itself.
+  events that carry **name + source file + line** — source locations are in the trace itself
+  (4,879 of the corpus's 27,760 specs have one).
+* **CPU timings** arrive in `CpuProfiler.EventBatchV2` blobs (V3 from UE 5.6 on). Every record
+  is one varint `(cycle << 2) | flags`, followed — **on begin records only** — by the spec id
+  as a second varint; an end record carries no id and is paired against that thread's own scope
+  stack, so a reader that expects an id after every record eats the next record's cycle (which
+  is what made 356 k batches look corrupt on the first parse). A cycle value *smaller* than the
+  previous one is a delta against it. Bit 2 of the flags marks the coroutine forms V3 added,
+  which carry a depth (and, when they begin, an id).
 
 ## 4. The schema — the file's own vocabulary
 
@@ -98,11 +127,42 @@ capture that has both). The engine's own reader of this channel is
 
 ## 6. What the corpus measured (2026-09-28)
 
-163,600 packets total: 138,830 raw, 24,767 LZ4-encoded, 3 sync. Highest-volume threads by
-packets: tid 2 (16,567 — the tracing thread), tids 4/5/6 (~13–14k each), then a long tail. The
-Importants stream: 2,491 packets. The schema: 51 event types = 2 Events packets / 3,312 decoded
-bytes (both packets decode with a from-scratch LZ4 block decoder — good evidence for §2). These
-are the numbers the parser's golden output must reproduce.
+The packet layer: 163,600 packets total — 138,830 raw, 24,767 LZ4-encoded, 3 sync — walking to
+exactly EOF (35,495,101 bytes), 49,857,025 bytes decoded over 107 streams. Highest-volume
+threads by packets: tid 2 (16,567 — the tracing thread), tids 4/5/6 (~13–14k each), then a long
+tail; 104 thread ids carry packets. The Events stream is 2 packets / 3,312 bytes and declares
+**51 event types in 51 records, 0 redefinitions**; Importants is 2,491 packets.
+
+The decoded model: 131 threads (122 named by the capture, in 8 groups), **960,142 events**,
+154,973 scope markers, 19,251 sync events whose serial range is **gapless** (span 19,251, 0
+missing — the strongest single check that the walker is in step), 837,357 CPU batches holding
+**10,055,971 records**, 2,826 frame pairs (2 unpaired begins), 24 bookmarks joined to their
+specs, 27,760 timer specs (4,879 with file:line), 182 counter specs, session duration 332.053 s.
+`verify` reports 0 errors and 0 warnings. These are the numbers the parser's golden output must
+reproduce (`goldens/labels/editor-pie-1.json` pins them).
+
+Cost, measured in this working tree on this machine (2026-09-28, a cold `verify`):
+
+| phase | serial | `--jobs 0` (the pool) |
+|---|---|---|
+| read the 34 MB file | 0.008 | 0.008 |
+| container header | 0.000 | 0.000 |
+| packets (163,600 headers) | 0.251 | 0.251 |
+| streams (LZ4: 24,767 blocks, 34.8 MB → 49.9 MB) | 0.599 | 0.599 |
+| model (the per-thread Python walk) | 9.560 | 4.140 |
+| **cold full decode** | **11.34** | **5.22** |
+
+A cached command is **0.49 s** and `goldens --check` ~15 s (its transcripts are the pinned commands'
+real output, so it now runs a full `verify`).
+
+Two histories are in that table. The LZ4 half is the C library (§2): with the pure-Python decoder
+the same cold decode was **21.3 s**. And the walk is per-thread work, so `--jobs` spreads it over
+processes — measured **9.56 / 5.41 / 4.14 / 4.16 / 4.15 s** at 1 / 2 / 4 / 8 / 12 workers. It stops
+at the *biggest* thread rather than at the core count: tid 2 owns 53.4% of the corpus's 10,055,971
+batch records, so the ceiling is that one thread, and `--jobs 0` (the default) caps its own choice
+at 8 workers — past that nothing improves here, while a capture whose work is spread evenly gets
+more of the box. The answer does not depend on `--jobs` at all: shares are merged by one function in
+ascending tid order, byte-for-byte into the cache's own format.
 
 ## 7. Where the format is defined (engine source tree)
 
@@ -118,6 +178,10 @@ Paths are relative to the engine source tree root.
 | `...\Detail\Protocols\Protocol7.h` | the well-known uids, incl. the timestamped scopes |
 | `...\Trace\Config.h` | block size, protocol selection |
 | `Engine\Source\Runtime\TraceLog\Private\Trace\EventNode.cpp` | how schema records are written (incl. the unwritten `Unused` byte) |
+| `Engine\Source\Runtime\TraceLog\Private\Trace\Field.cpp` | how aux data is segmented: a header per segment, each carrying the same field index |
+| `Engine\Source\Runtime\TraceLog\Private\Trace\LZ4\` | the engine's own vendored LZ4 (v1.9.2 — the same version `src/cpp/third_party/lz4` carries) which compresses the packets §2 decodes |
+| `Engine\Source\Runtime\TraceLog\Public\Trace\Detail\Important\ImportantLogScope.inl` | the important streams' own aux framing (unshifted uids, a terminal after every field) |
+| `Engine\Source\Developer\TraceServices\Private\Analyzers\CpuProfilerTraceAnalysis.cpp` | the engine's own batch decoder: a begin record carries a spec id, an end record does not |
 | `Engine\Source\Developer\TraceAnalysis\Private\Analysis\Engine.cpp` | the reader our parser mirrors: magic/metadata stages, packet transport, event parsing, the serial min-heap |
 | `Engine\Source\Runtime\Core\Public\ProfilingDebugging\CpuProfilerTrace.h` | timer specs (name + file + line), the scope API |
 | `Engine\Source\Runtime\Core\Public\ProfilingDebugging\CsvProfilerTrace.h` | the `CsvProfiler` channel's events (§5) |

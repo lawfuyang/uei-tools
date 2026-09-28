@@ -13,8 +13,8 @@ Markdown (the human summary), with every finding carrying its evidence. Where th
 ships a tool for a question (the **CsvTools** executables, §2), this repo *wraps* it instead of
 reimplementing it, and folds its output into ours.
 
-The commands in §4 are the contract the tools will be built to; the build order, priorities and
-effort figures live in `ROADMAP.md`.
+The parser core is implemented and its commands are §4; what is still planned — the CsvTools
+bridge (§2), the summary layer and the analyses on top of it — is in `ROADMAP.md`.
 
 > ## Vibe coded — use at your own risk
 >
@@ -28,11 +28,12 @@ effort figures live in `ROADMAP.md`.
 
 | Requirement | Notes |
 |---|---|
-| Python 3.8+ | 3.11.3 tested; standard library only, plus the optional `lz4` decoder (ROADMAP §1) |
+| Python 3.8+ | 3.11.3 tested; standard library only |
+| CMake + a C compiler | once per checkout: `python src\py\ueia.py lz4 --build` compiles `bin/ueia_lz4.dll` — the LZ4 decoder for the encoded packets (24,767 of them in the corpus) — from the source vendored under `src/cpp/third_party/lz4`, and does nothing when it is already current. Underneath it is `cmake -S . -B build` then `cmake --build build --config Release` |
 | A `.utrace` capture | the corpus, §1.1 — analysis is offline; nothing connects anywhere |
 | **Unreal Engine directory** | passed as `--engine-dir <dir>` (or `UEI_ENGINE_DIR`). It is used for three things: the **CsvTools executables** under `<engine-dir>\Engine\Binaries\DotNET\CsvTools` (§2), the engine **source tree** under `<engine-dir>\Engine\Source` (module/source mapping; optional), and the engine **version** from `<engine-dir>\Engine\Build\Build.version`, which stamps every report's `meta` block. Without it, the features that need it report **skipped** — never silently pass. |
 | A CSV Profiler capture | optional: a `.csv` (or `.csv.bin`) written by the CSV Profiler, or a `.utrace` that carries the channel (see §2) — either can drive the CsvTools pipeline |
-| `lz4` (optional) | the corpus capture holds 24,767 LZ4-encoded packets; without the module, those packets are refused with the fix in the message rather than a traceback (ROADMAP §1) |
+| The LZ4 decoder | `bin/ueia_lz4.dll` (the build above), else whatever the system has (`$UEI_LZ4_DLL` names one explicitly: `lz4.dll`, `liblz4.so.1`, `liblz4.so`, `liblz4.dylib` in that order). There is **no decoder of our own** on purpose — one decoder means one answer — so a machine without one is a refusal that names the build command, never a silent fallback. `lz4` (below) reports which library answered, whether it matches the recipe that built it, and decodes a block whose answer is known |
 
 The capture format — container, packets, event streams, schema, the engine files that define
 each, and the measured numbers of the corpus — is documented in `REFERENCE.md`, not here.
@@ -58,9 +59,10 @@ schema. The corpus rules are inherited from rdc-tools wholesale:
   files. A **CSV Profiler capture** (`-csvcapture`, `CsvProfiler.Start`, ...) is wanted too —
   see §2 for why.
 
-## 2. CsvTools — the engine's CSV toolbox, reused and never reimplemented
+## 2. CsvTools — the engine's CSV toolbox, reused and never reimplemented (planned — ROADMAP §1)
 
-The engine ships its whole CSV Profiler toolchain as self-contained .NET executables under
+Nothing in this section exists yet as a command; it is the contract the `csv` family will be
+built to. The engine ships its whole CSV Profiler toolchain as self-contained .NET executables under
 `<engine-dir>\Engine\Binaries\DotNET\CsvTools`. They are **the** answer for CSV statistics,
 filtering, splitting, collating, graphs and performance reports, and this repo's rule is:
 **wrap the executable, parse its output, cite it — never write our own version of what it
@@ -117,26 +119,45 @@ the file itself** — structured findings, ranked recommendations, A/B compariso
 machine-readable schemas, one engine-dir flag that reaches every engine-provided tool — with no
 session, no device and no human in front of a timeline.
 
-## 4. The intended surface (`ROADMAP.md` is the build order)
+## 4. The commands
 
-One entry point, rdc-tools style: `python src\py\ueia.py <command> ...` (plain text by default,
-`--format json|markdown` where tabular; stdout is the contract). Commands that need
-engine-provided tooling take `--engine-dir` (or `UEI_ENGINE_DIR`).
+One entry point, rdc-tools style: `python src\py\ueia.py <command> <capture.utrace> [args]`.
+Plain text by default; the row commands take `--format table|csv|markdown` (in the non-table
+forms stdout is the table alone and the prose moves to stderr, and every cap applies in all
+three). Commands that need engine-provided tooling will take `--engine-dir` (or `UEI_ENGINE_DIR`).
 
-| Command | What it will answer |
+| Command | What it answers |
 |---|---|
-| `analyze --trace X [--engine-dir D] --sections summary,bottlenecks,hitches,... --format json` | the composed report: frame stats, thread utilisation, hot timers (incl/excl), bottleneck classification with confidence, hitch list |
-| `compare --trace-a A --trace-b B` | before/after A/B on cached analyses |
-| `explain --trace X --timer "FName::Tick" --frame-range 1200-1250` | the deep dive on one timer/frame range |
-| `csv info\|split\|convert\|filter\|collate\|svg\|report\|regressions <csv> --engine-dir D` | the §2 executables, wrapped 1:1, their outputs folded into ours (and available raw) |
-| `csv from-trace X -o capture.csv --engine-dir D` | a CSV Profiler-format CSV synthesized from a trace's `CsvProfiler` channel, ready for the exes above |
-| `export --trace X --what events,jsonl` | raw/intermediate data for further agent processing |
+| `info <capture>` | the file's own account of itself: magic, versions, metadata block, packet counts, bytes decoded, and whether the walk ends exactly at EOF |
+| `packets <capture> [--limit N] [--tid N]` | the packet table: index, offset, size, decoded size, thread, form (raw/lz4/sync) |
+| `schema <capture> [--filter TEXT] [--limit N]` | the capture's own vocabulary: uid, flags, `Logger.Event`, each field with its type, and how many events of that type fired on thread streams |
+| `threads <capture>` | every thread: name and group as the capture itself names them, packets, bytes, events, batches, batch records, first/last cycle (on a cache miss it builds the model, so `--jobs` applies) |
+| `timers <capture> [--filter TEXT] [--limit N]` | the CPU profiler's timer specs: id, name, file:line |
+| `frames <capture> [--limit N]` | `Misc.BeginFrame`/`EndFrame` pairs per thread and frame type, in cycles and seconds since the trace started |
+| `verify <capture> [--jobs N]` | walks everything and reports what does not add up: packet and stream anomalies, schema redefinitions, serial gaps, unpaired frames, unknown bookmark points. **Exit 1** when anything error-level was found |
+| `parse <capture> [--jobs N]` | builds (and caches) the session model; prints what it holds |
+| `cache <capture> [--clear]` | the parse cache beside a capture: status, or remove it |
+| `lz4 [--build] [--force]` | the LZ4 decoder: which library answered, its version, whether it matches the recipe that built it, and a decode of a known block as proof it works. `--build` compiles `bin/ueia_lz4.dll` when it is missing or stale (`--force` rebuilds either way). Exit 0 usable and current / 1 stale or broken / 2 nothing to decode with |
+| `selftest [-v] [-k PATTERN]` | the hermetic unit-test suite — no capture, no engine directory, no network. Exit 0 pass / 1 fail / 2 bad option |
+| `goldens [--check\|--write] [--capture KEY] [-v]` | the corpus: re-runs the pinned commands over the captures this machine has and compares. Exit 0 matched / 1 a problem / 2 nothing to compare |
 
-Output philosophy: every report carries a `meta` block (tool version, input hashes, engine and
-protocol version detected, engine-dir path as configured, analysis duration, limitations, and
-the list of wrapped executables with their versions and argv); every finding carries `id`,
-`severity`, `confidence`, `category`, `evidence` (timer names, frame numbers, percentages) and
-`suggested_actions`. JSON is primary and schema-versioned; Markdown is the summary.
+The parse cache sits beside the capture, keyed by its SHA-256 and the tool version, and never
+changes an answer — only the seconds a command takes: measured on the corpus, a cold full decode
+is 5.2 s (the LZ4 half, in the C library, is 0.6 s of it, and the per-thread walk runs over
+worker processes) and a cached command 0.49 s. `--jobs N` sets how many processes that walk may
+use — `parse` and `verify` are the commands that walk — and `--jobs 0` (the default) chooses for
+the machine. It cannot change a byte of the output; the suite pins serial ≡ parallel.
+
+Planned (see `ROADMAP.md`): the `csv` family wrapping CsvTools (§2), then the summary layer,
+bottleneck classification, critical path, parallelism findings, source mapping,
+recommendations, `compare`, `explain` and `export`.
+
+Output philosophy for those: every report carries a `meta` block (tool version, input hashes,
+engine and protocol version detected, engine-dir path as configured, analysis duration,
+limitations, and the list of wrapped executables with their versions and argv); every finding
+carries `id`, `severity`, `confidence`, `category`, `evidence` (timer names, frame numbers,
+percentages) and `suggested_actions`. JSON is the machine interface and schema-versioned;
+Markdown is the summary.
 
 ## 5. The playbook (agent rules, inherited from rdc-tools)
 

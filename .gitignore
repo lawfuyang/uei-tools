@@ -1,1 +1,9 @@
 REFERENCES/
+bin/
+build/
+__pycache__/
+*.pyc
+goldens/local/
+goldens/captures.local.json
+*.ueiacache
+*.ueiacache.tmp

@@ -1,0 +1,3 @@
+# Vendored third-party sources are kept byte-exact: the build stamp hashes the working copy, and a
+# checkout that rewrote their line endings would make a current DLL look stale for no reason.
+src/cpp/third_party/lz4/* -text

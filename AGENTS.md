@@ -5,14 +5,65 @@ what they do; nothing here is a supported product. This repo is built in the fla
 [rdc-tools](https://github.com/lawfuyang/rdc-tools) — where a rule below says "inherited", the
 precedent and the scar tissue behind it are in that repo's `AGENTS.md`.
 
-## The gates do not exist yet
+## The gates — run them after every change
 
-ROADMAP §1 lands them **with** the parser, not after: the hermetic `selftest` suite, a clean
-`npx --yes pyright@latest` (0 errors, 0 warnings), and the goldens corpus harness. Until then
-the standing rules below are the whole contract; from then on, a change to `src/` is not
-finished until all three pass. A change that can move what a **command prints** is not finished
-until the corpus agrees (`goldens --check`, with rdc-tools' exit-2-means-not-compared convention
-for machines without the captures).
+Any change to `src/py/` or `tests/` is not finished until all three pass:
+
+```powershell
+python src\py\ueia.py lz4 --build       # step 0: bin/ueia_lz4.dll, built only when stale
+python src\py\ueia.py selftest          # the hermetic suite: ~10 s, exit 0 pass / 1 fail / 2 bad option
+npx --yes pyright@latest                # must print: 0 errors, 0 warnings
+python src\py\ueia.py goldens --check   # the corpus: exit 0 matched / 1 a problem / 2 nothing to compare
+```
+
+Step 0 is the decoder's build, and it is part of the pipeline rather than advice: `lz4 --build`
+hashes the recipe (both LZ4 sources and `CMakeLists.txt`, so a flag change counts) against the
+stamp the build wrote beside the DLL, runs `cmake` only when the DLL is missing or stale, and
+self-tests the result by decoding a block whose answer is known. A run with nothing to do costs
+three file hashes and no compiler. Never commit `bin/` or `build/`, and never ship a second
+decoder to avoid the build.
+
+The build is a prerequisite of the *corpus* half, not of the hermetic one: without
+`bin/ueia_lz4.dll` the tool refuses the 24,767 encoded packets rather than decoding them itself,
+and the suite's real-library class **skips** (and says so in its count) while its logic half runs
+against a stand-in C function. Report a skip; do not paper over it.
+
+`selftest -v` prints per-test output and `selftest -k <text>` filters by test id. A change that
+can move what a **command prints** is not finished until the corpus agrees: `goldens --write`
+refreshes this machine's transcripts (gitignored — a transcript is the capture's own words) and
+that diff is the review, and `goldens --check` exits **2** when no capture is present here,
+which means "nothing compared", never "pass". Report the real numbers (test count, pyright's
+error and warning counts), not "passes".
+
+## Layout — so a new module has an obvious home
+
+`src/py/`, one module per layer, each importing only *down* the layering, and **unprefixed**:
+the entry point is `ueia.py`, so a module's name is its job, not its owner.
+
+`shapes` (shapes, constants, errors) → `lz4` and `timing` (leaves; `lz4` is the ctypes loader,
+not a decoder of our own) → `container` (header + packet walk) → `streams` (per-thread streams)
+→ `events` (framing: records, events, aux, scopes) → `schema` (the vocabulary) → `decode`
+(values + the batch format) → `model` (the session model) → `cache` (the parse cache) →
+`goldens` (the corpus harness) → `commands` (the commands and their rendering) → `ueia.py` (the
+CLI, which re-exports them all for scripts and tests).
+
+Two names are deliberately *not* the obvious ones, and the reasons are measured:
+`types.py` is impossible — the interpreter preloads the stdlib `types`, so `import types` would
+never reach our file and our own `from types import ...` would fail — and `profile.py` would
+shadow a stdlib module in a folder every test puts on `sys.path`. Hence `shapes.py` and
+`timing.py`. A module may not be named after a stdlib module; check before renaming one.
+
+`src/cpp/third_party/lz4/` is the vendored LZ4 v1.9.2 the root `CMakeLists.txt` builds as
+`bin/ueia_lz4.dll` (both `bin/` and `build/` are gitignored — the DLL is a build artifact, so
+nothing may depend on it being committed, and nothing may ship a second decoder). `tools/stamp_lz4.cmake`
+writes `bin/ueia_lz4.build.json` beside it from the build itself: that stamp is what makes
+"is this library current?" answerable, and the Python side (`lz4.build_state`) reads it rather
+than trusting a timestamp.
+
+`tests/` is the hermetic suite: `testcase.py` is the shared floor (paths, scratch dir, CLI
+runner — not a test file, and discovery is pinned to `test_*.py` because of it), `fixtures.py`
+builds valid traces in memory, and the LZ4 class that loads the real library skips without it.
+`goldens/` holds the committed corpus identity plus this machine's gitignored transcripts.
 
 ## Tests come with the feature — every time
 
@@ -40,6 +91,24 @@ The suite is **hermetic**: it needs no capture, no GPU, no engine directory and 
 fixture traces are built in memory in `tests/`. Wrapped exes are stubbed with a fixture binary
 for the same reason. Checks that *do* need this machine's captures or a real engine directory
 are the goldens half, reported separately, where "not compared" is never "pass".
+
+## Parallel work (the one place processes are used)
+
+`--jobs N` spreads the *per-thread* model walk over N worker processes
+(`model._parallel_shares`); `0`, the default, chooses for the machine: one process until the
+decoded streams pass `_PARALLEL_MIN_BYTES`, then the box's cores capped at `_AUTO_WORKERS_MAX`
+(past a handful nothing improves on a lopsided capture — REFERENCE §6 has the measured series).
+Three rules come with it, and the first two are scars:
+
+* **A worker function is module-level.** `spawn` sends the function by name and the arguments
+  pickled, so a lambda, a closure or an unpicklable object cannot be a unit of work.
+* **The pool may not fail silently.** `ProcessPoolExecutor` replaces a dead worker and retries the
+  same unit *for ever* — an initializer that raised cost an hour of wall-clock on 2026-09-28 with
+  nothing on stdout to say so. The shared context is therefore handed over pickled (a mistake then
+  fails in this process, when the pool is built), and a unit with no result inside
+  `_STALL_TIMEOUT` is reported as a stall — a no-progress budget, never a total one.
+* **`--jobs` may not change the answer.** Shares meet in one `_merge_share`, in ascending tid order,
+  and the suite pins serial ≡ parallel at the cache's own byte level.
 
 A bug fix lands with a test that fails before the fix. Never weaken, skip or delete an
 assertion to make a run pass; a test pinning behaviour that looks wrong is marked
@@ -103,8 +172,9 @@ suite's real numbers — test count, pass/fail, pyright errors — not "passes".
 
 ## Python coding guidelines (inherited from rdc-tools, enforced from phase 1)
 
-Target: **Python 3.8+, standard library only** (plus the optional, lazily-imported `lz4`),
-pyright `"standard"` mode, zero errors and zero warnings.
+Target: **Python 3.8+, standard library only** — the one native piece is the vendored LZ4 DLL,
+reached through `ctypes` and never through a third-party Python package — pyright `"standard"`
+mode, zero errors and zero warnings.
 
 * `from __future__ import annotations` at the top of every module; annotate every parameter and
   return. Modern annotation syntax is allowed *because* of that future import, but nothing that
