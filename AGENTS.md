@@ -92,6 +92,16 @@ fixture traces are built in memory in `tests/`. Wrapped exes are stubbed with a 
 for the same reason. Checks that *do* need this machine's captures or a real engine directory
 are the goldens half, reported separately, where "not compared" is never "pass".
 
+## Channels: absent is not zero
+
+A capture carries only what it was recorded with (the channel inventory is REFERENCE §8): a trace
+without `gpu` cannot answer a GPU question, one without `memtag`/`memalloc` cannot answer a memory
+question, and one without `task` cannot show a critical path. An analysis whose channel is missing
+reports **skipped** with the re-record line, never zero, never a default and never a guess — the
+same rule as the corpus half's exit 2, one level down. Every analysis that lands says in its tests
+what it does with its channel absent, and `coverage` (ROADMAP §10) is the one command that has to
+get this right for all of them at once.
+
 ## Parallel work (the one place processes are used)
 
 `--jobs N` spreads the *per-thread* model walk over N worker processes
@@ -200,7 +210,7 @@ mode, zero errors and zero warnings.
 ## Conventions
 
 * Docs: `README.md` (setup, corpus, CsvTools reuse, the playbook), `REFERENCE.md` (the capture
-  format, decoded: container, packets, event streams, schema incl. the `CsvProfiler` channel,
+  format, decoded: container, packets, event streams, schema incl. the CSV Profiler's events,
   the engine file map, corpus measurements), `ROADMAP.md` (build order, P-labels, scope, the
   not-list — landed items are removed, cross-references updated in the same change),
   `AGENTS.md` (this file).

@@ -4,7 +4,7 @@ The detail behind `README.md`: how an Unreal Insights capture is laid out, fact 
 statement below was read from the engine source (UE 5.8.3; the file map is §7) and **validated
 against the corpus**: a packet walk of `editor-pie-1` consumes the file exactly, and its whole
 schema — 51 event types in 2 Events packets (3,312 bytes decoded) — decodes cleanly. This is the
-spec the parser (ROADMAP §1) implements, and these numbers are its golden targets.
+spec the parser implements, and these numbers are its golden targets.
 
 ## 1. Container
 
@@ -104,7 +104,7 @@ Three measured facts the decoder must respect:
 * **The engine tree answers *layout* questions; the capture answers *vocabulary* ones.** Event
   and timer names are decoded from these records, never hardcoded.
 
-## 5. The `CsvProfiler` channel
+## 5. The CSV Profiler's events (the `CsvProfiler` logger, on the `counters` channel)
 
 The CSV Profiler emits its data into the trace under the `CsvProfiler` logger
 (`ProfilingDebugging/CsvProfilerTrace.h`), which is what makes a `.utrace` a valid input for the
@@ -120,8 +120,8 @@ CsvTools pipeline (README §2):
   Value)`.
 
 Corpus state: the definitions are present, the per-frame events are not — `editor-pie-1` ran
-with the CSV profiler *registered* but no CSV capture active (README §2, ROADMAP §2 want a
-capture that has both). The engine's own reader of this channel is
+with the CSV profiler *registered* but no CSV capture active (README §2, ROADMAP §1 and §14 want a
+capture that has both). The engine's own reader of these events is
 `TraceServices\Private\Analyzers\CsvProfilerTraceAnalysis.cpp`, feeding the
 `CsvProfilerProvider` model.
 
@@ -181,8 +181,66 @@ Paths are relative to the engine source tree root.
 | `Engine\Source\Runtime\TraceLog\Private\Trace\Field.cpp` | how aux data is segmented: a header per segment, each carrying the same field index |
 | `Engine\Source\Runtime\TraceLog\Private\Trace\LZ4\` | the engine's own vendored LZ4 (v1.9.2 — the same version `src/cpp/third_party/lz4` carries) which compresses the packets §2 decodes |
 | `Engine\Source\Runtime\TraceLog\Public\Trace\Detail\Important\ImportantLogScope.inl` | the important streams' own aux framing (unshifted uids, a terminal after every field) |
+
+## 8. The channels, and what each one lets you answer
+
+A capture carries only what it was recorded with (`-trace=<id>,<id>...`; the macros that declare a
+channel are `UE_TRACE_CHANNEL*` in `Runtime\TraceLog\Public\Trace\Trace.h`). This is the inventory
+of what the engine can emit — gathered from the tree on 2026-09-28, grouped by the question it
+answers, with the engine analyser to mirror for field-level truth. **An absent channel is not a
+zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §10).
+
+| Channel | Carries | Answers | Engine analyser to mirror |
+|---|---|---|---|
+| `cpu` | CPU scopes on every thread (`CpuProfiler`) | which work owns the frame: the call tree, per-thread timelines, self time | `CpuProfilerTraceAnalysis.cpp` |
+| `gpu` | GPU timings, breadcrumbs, queue sync (`GpuProfiler`) | per-pass cost, GPU-bound confirmation, CPU↔GPU waits | `GpuProfilerTraceAnalysis.cpp` (and `OldGpuProfiler…` for the pre-5 format) |
+| `frame` | frame durations per frame type | frame boundaries without `Misc.BeginFrame` | `MiscTraceAnalysis.cpp` |
+| `bookmark` | low-frequency markers (boot, level load) | ✓ used: 24 bookmarks joined in the corpus | `BookmarksTraceAnalysis.cpp` |
+| `region` | thread-agnostic timespans | "what happened inside this region" | `MiscTraceAnalysis.cpp` |
+| `screenshot` | embedded screenshots | line a finding up with what was on screen | `MiscTraceAnalysis.cpp` |
+| `log` | log messages | ✓ used: counts + specs | `LogTraceAnalysis.cpp` |
+| `counters` | numeric counters over time; **the CSV Profiler's events ride here** | stat/counter series, CSV profiling | `CountersTraceAnalysis.cpp`, `CsvProfilerTraceAnalysis.cpp` |
+| `stats` | `DECLARE_STATS_GROUP` stats as counters | the numbers a `stat` HUD shows, per frame | `StatsTraceAnalysis.cpp` |
+| `memtag` | LLM tag memory values | memory budgets per tag over time | `MemoryAnalysis.cpp` |
+| `memalloc` | allocations (size, lifetime) | churn, top sites, growth that never returns | `AllocationsAnalysis.cpp` |
+| `callstack` | allocation callstacks (spec + frames) | allocation sites — *by module+offset* without symbols | `CallstacksAnalysis.cpp` |
+| `module` | loaded modules (base, size, path) | module grouping; the input symbolication needs | `ModuleAnalysis.cpp` |
+| `task` | task-graph lifecycle and dependencies | critical path, parallelism, waits | `TasksAnalysis.cpp` |
+| `loadtime`, `asset` | package/request-group load timing | load trees, slowest packages and assets | `LoadTimeTraceAnalysis.cpp` |
+| `file` | platform-file open/close/read/write | IO wait vs CPU work | `PlatformFileTraceAnalysis.cpp` |
+| `iostore` | I/O dispatcher, chunk loading | streaming detail behind the file channel | (IoStore provider) |
+| `assetmetadata` | asset metadata records | asset identity for a report | `MetadataAnalysis.cpp` (metadata provider) |
+| `metadata` | scoped key/value metadata | build/changelist/platform/device context | `MetadataAnalysis.cpp` |
+| `net` | connections, packets, objects | network replication cost | `NetTraceAnalyzer.cpp` |
+| `object`, `objectproperties` | UObject lifecycle, property changes | object lifetime; allocation attribution | `ObjectTraceAnalysis.cpp` |
+| `slate` | Slate UI timing | UI cost per frame (read by the Insights UI; no TraceServices analyser) | — |
+| `rdg`, `rendercommands`, `rhicommands` | render-graph and command streams | render-thread depth (Read by the RenderGraph Insights plugin) | — |
+| `audio`, `audio.mixer` | audio mixer events | audio cost per frame (Audio Insights plugin) | — |
+| `cook`, `save`, `http`, `rac`, `mass`, `animation` | editor/cook, save, HTTP, race detector, Mass, animation | long tail: detected and named, not analysed yet | `CookAnalysis.cpp`, `VerseTraceAnalysis.cpp`, … |
+
+Capture presets the engine ships (`TraceAuxiliary.cpp`): `-trace=Default` is
+`cpu,gpu,frame,log,bookmark,screenshot,region`, and `-trace=Memory` is
+`memtag,memalloc,callstack,module` (read-only). `-trace=Memory_Light` is `memtag,memalloc`.
+The corpus (`editor-pie-1`) carries `cpu` (scopes), `frame`, `log`, `bookmark`, `counters`,
+`region`-free but scope-rich — and **no** `gpu`, `task`, `memtag`, `memalloc`, `loadtime` or
+`screenshot`, which is exactly why several roadmap items want a second capture.
+
+## 9. Engine programs that read traces (what we wrap, and what we do not)
+
+| Program | Where | Editor build needed? | What it gives us |
+|---|---|---|---|
+| `TraceQuery` | `Engine\Source\Programs\TraceQuery` | **no** | runs the engine's own analysers (CPU profiler, counters, memory, regions, log) and emits **JSON** — the strongest offline cross-check of our parser |
+| `TraceAnalyzer` | `Engine\Source\Programs\TraceAnalyzer` | **no** | trace → text dump; the tool for decoding a channel we have not parsed yet |
+| `TraceTrimmer` | `Engine\Source\Programs\TraceTrimmer` | **no** | trims/rewrites traces (smaller fixtures, shareable captures) |
+| `UnrealInsights.exe` headless | `Engine\Source\Programs\UnrealInsights` | **yes** (not shipped prebuilt here) | `-NoUI -AutoQuit -ExecOnAnalysisCompleteCmd="…"` with `TimingInsights.ExportTimers/ExportThreads/ExportTimingEvents/ExportTimerStatistics/ExportTimerCallees/ExportCounters/ExportCounterValues` and `MemoryInsights.ExportAllocs`; a response file (`@=file.rsp`) runs several. CSV/TSV/TXT out |
+| CsvTools | `Engine\Binaries\DotNET\CsvTools` (prebuilt here) | no | the CSV Profiler chain (README §2) |
+| `NetworkProfiler.exe` | `Engine\Binaries\DotNET` (prebuilt) | no | the *legacy* network profiler format, **not** `.utrace`: out of scope, listed so nobody re-derives it |
+| `AutomatedPerfTesting` plugin, Gauntlet (`RunInsightsTests.cs`) | `Engine\Plugins\Performance`, `Programs\AutomationTool` | n/a | the engine's own scripted-perf-CI machinery: we consume the `.utrace`/`.csv` it produces, never the runner |
+
+Also prebuilt in this checkout and worth a look later: `iostore_analysis.exe`,
+`AnalysisTabUtils.exe` (`Engine\Binaries\Win64`).
 | `Engine\Source\Developer\TraceServices\Private\Analyzers\CpuProfilerTraceAnalysis.cpp` | the engine's own batch decoder: a begin record carries a spec id, an end record does not |
 | `Engine\Source\Developer\TraceAnalysis\Private\Analysis\Engine.cpp` | the reader our parser mirrors: magic/metadata stages, packet transport, event parsing, the serial min-heap |
 | `Engine\Source\Runtime\Core\Public\ProfilingDebugging\CpuProfilerTrace.h` | timer specs (name + file + line), the scope API |
-| `Engine\Source\Runtime\Core\Public\ProfilingDebugging\CsvProfilerTrace.h` | the `CsvProfiler` channel's events (§5) |
+| `Engine\Source\Runtime\Core\Public\ProfilingDebugging\CsvProfilerTrace.h` | the CSV Profiler's events — they ride the `counters` channel (§5) |
 | `Engine\Source\Developer\TraceServices\Private\Analyzers\CsvProfilerTraceAnalysis.cpp` | the engine's own analysis of that channel |

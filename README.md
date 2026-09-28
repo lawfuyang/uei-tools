@@ -88,12 +88,12 @@ the executables are self-contained .NET — no install, no SDK, just the engine 
 
 **Where the CSV comes from.** The CSV Profiler writes `.csv` / `.csv.bin` captures directly, and
 *also* emits its channel into a `.utrace` when tracing is on. Our tool accepts both: a CSV file
-is passed through as-is, and a trace whose `CsvProfiler` channel holds data is synthesized into a
+is passed through as-is, and a trace whose CSV Profiler events hold data is synthesized into a
 CSV Profiler-format `.csv` first — the channel carries the stat definitions
 (`RegisterCategory`, `DefineDeclaredStat`, `DefineInlineStat`) and, when a CSV capture was
 running, the per-frame values too (`BeginStat`/`EndStat`/`CustomStat`/`Event`/`Metadata`, see
 `REFERENCE.md`). The corpus capture has the definitions but no per-frame CSV events — a capture
-with a CSV capture running is wanted (ROADMAP §2).
+with a CSV capture running is wanted (ROADMAP §1, §14).
 
 ## 3. What the engine already answers (and this tool does not rebuild)
 
@@ -148,9 +148,12 @@ worker processes) and a cached command 0.49 s. `--jobs N` sets how many processe
 use — `parse` and `verify` are the commands that walk — and `--jobs 0` (the default) chooses for
 the machine. It cannot change a byte of the output; the suite pins serial ≡ parallel.
 
-Planned (see `ROADMAP.md`): the `csv` family wrapping CsvTools (§2), then the summary layer,
-bottleneck classification, critical path, parallelism findings, source mapping,
-recommendations, `compare`, `explain` and `export`.
+Planned (see `ROADMAP.md`): the `csv` family wrapping CsvTools (§2), then the summary layer with
+frame-time budgets, percentiles and hitch tables, bottleneck classification (CPU/GPU/display),
+the timer **call tree** and self time, thread occupancy, the critical path / task graph, source
+mapping, a `coverage` command that says whether a capture can answer a question at all, GPU /
+memory / loading / stats-channel analyses, the recommendations engine, and `compare` as a CI gate
+with p99 thresholds and rolling baselines.
 
 Output philosophy for those: every report carries a `meta` block (tool version, input hashes,
 engine and protocol version detected, engine-dir path as configured, analysis duration,
@@ -184,7 +187,7 @@ Markdown is the summary.
 ## Where the rest of the manual lives
 
 * **`REFERENCE.md`** — the capture format, decoded: the container, packets, event streams, the
-  schema (incl. the `CsvProfiler` channel), the corpus measurements, and the engine files that
+  schema (incl. the CSV Profiler's events), the corpus measurements, and the engine files that
   define each.
 * **`ROADMAP.md`** — the build order with P-labels and effort figures, the language decision,
   and what is deliberately *not* on the list.
