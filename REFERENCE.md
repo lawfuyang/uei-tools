@@ -125,6 +125,26 @@ capture that has both). The engine's own reader of these events is
 `TraceServices\Private\Analyzers\CsvProfilerTraceAnalysis.cpp`, feeding the
 `CsvProfilerProvider` model.
 
+**What `csv from-trace` writes, and why it is that shape.** The file the CsvTools executables read
+is defined by `CsvStats.ReadCSVFromLines` (read 2026-09-28), and our writer is built to pass it:
+
+* the **first line is the column header**, `EVENTS,<series names>` -- the first column is the events
+  column and is named `EVENTS`, whatever the series are called;
+* **one line per frame**, each `<events>,<value>,<value>,...`, where the events column holds
+  `name##seconds` entries joined by `;` (a `,` or `;` inside a name becomes `.`), and the values
+  follow the header's order;
+* the **last line is metadata** (`[Key],Value` pairs, keys lower-cased by the reader): ours carries
+  `[EventTimestamps]`, `[FramesFrom]`, `[SynthesizedBy]` and `[Source]` -- never a machine path;
+* **numbers** follow the engine's own `FCsvWriterHelper` formatting: `%.0f` when integral, `%.6f`
+  below 0.1, `%.4f` otherwise; a series with no value in a frame is **`0`**, never blank;
+* **series names** follow the engine's writer: `<Thread>/<Category>/<Stat>` for a timed stat and
+  `<Category>/<Stat>` for a custom one (`ECsvCustomStatOp {Set, Min, Max, Accumulate}` combines the
+  repeats inside a frame, and a timed stat's cycles become **milliseconds** through the session's
+  `cycle_frequency`);
+* **frames** are the trace's own `Misc.BeginFrame`/`Misc.EndFrame` pairs of the thread that emitted
+  the values, because the CSV Profiler's frame counter is not in the trace -- and the metadata says
+  so. A value before the first frame is counted as dropped, and the command reports the count.
+
 ## 6. What the corpus measured (2026-09-28)
 
 The packet layer: 163,600 packets total — 138,830 raw, 24,767 LZ4-encoded, 3 sync — walking to
@@ -188,7 +208,7 @@ A capture carries only what it was recorded with (`-trace=<id>,<id>...`; the mac
 channel are `UE_TRACE_CHANNEL*` in `Runtime\TraceLog\Public\Trace\Trace.h`). This is the inventory
 of what the engine can emit — gathered from the tree on 2026-09-28, grouped by the question it
 answers, with the engine analyser to mirror for field-level truth. **An absent channel is not a
-zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §10).
+zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §9).
 
 | Channel | Carries | Answers | Engine analyser to mirror |
 |---|---|---|---|

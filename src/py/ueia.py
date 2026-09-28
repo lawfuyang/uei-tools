@@ -2,6 +2,7 @@
 
 Usage:
   python src\\py\\ueia.py <command> <capture.utrace> [args...]
+  python src\\py\\ueia.py csv <subcommand> [args...] [--engine-dir DIR]
   python src\\py\\ueia.py lz4 [--build] [--force]
   python src\\py\\ueia.py selftest [-v] [-k PATTERN]
   python src\\py\\ueia.py goldens [--check|--write] [--capture KEY] [-v]
@@ -19,6 +20,22 @@ Commands:
                               (exit 1 when anything error-level was found)
   parse <capture>             build (and cache) the session model; prints what it holds
   cache <capture> [--clear]   the parse cache beside a capture: status, or remove it
+
+  csv <subcommand> ...        the engine's CSV toolbox, wrapped and never reimplemented
+                              (--engine-dir DIR or $UEI_ENGINE_DIR; exit 2 when there
+                              is no engine tree, never a silent pass):
+    info <capture.csv>          a CSV's shape and numbers (--json FILE for the machine
+                                form, --show averages|min|max|totals|all-stats|events)
+    split <capture.csv>         one CSV per distinct value of a stat (--stat NAME)
+    convert                     text <-> .csv.bin, metadata edits, integrity (--in,
+                                --out-format, --set-metadata, --verify)
+    filter <capture.csv>        only the wanted columns (--stats LIST | --defaults)
+    collate                     many CSVs into one table (--csvs LIST | --dir DIR)
+    svg                         the SVG graph renderer (--stats LIST, --out FILE)
+    report                      the full HTML/CSV/JSON report bundle (--csv F | --dir D)
+    regressions                 threshold report between a summary CSV and thresholds
+    from-trace <capture.utrace> synthesize the CSV Profiler .csv from a capture's own
+                                CSV events -- the bridge no engine exe offers (--out FILE)
 
   lz4 [--build] [--force]     the LZ4 decoder library the encoded packets need: is it
                               there and is it current, and build it when it is not
@@ -67,6 +84,7 @@ from streams import *  # noqa: F401,F403
 from timing import *  # noqa: F401,F403
 from commands import (
     cmd_cache,
+    cmd_csv,
     cmd_frames,
     cmd_info,
     cmd_lz4,
@@ -111,6 +129,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         if command == "lz4":
             return cmd_lz4(args[1:])
+        if command == "csv":
+            return cmd_csv(args[1:])
         if command == "selftest":
             return cmd_selftest(args[1:])
         if command == "goldens":

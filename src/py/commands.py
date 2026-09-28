@@ -15,21 +15,28 @@ command was warm).
 from __future__ import annotations
 
 import csv as csv_module
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
 
 import cache
 import container
+import csvprof
+import engine
 import lz4
+import schema
 import timing
+import toolrun
 import streams
 from container import Anomaly
 from goldens import REPO_ROOT, cmd_goldens
-from model import SessionModel, build_model, seconds_for_cycle
+from model import SessionModel, build_model, seconds_for_cycle, zero_counts
 from shapes import (
     PROTOCOL_CURRENT,
+    TID_EVENTS,
     TRANSPORT_TID_PACKET_SYNC,
     ContainerHeader,
     PacketRow,
@@ -38,8 +45,21 @@ from shapes import (
 )
 
 FORMATS = ("table", "csv", "markdown")
-_VALUE_OPTIONS = frozenset(("format", "limit", "tid", "filter", "jobs"))
-_BOOL_OPTIONS = frozenset(("clear", "build", "force"))
+_VALUE_OPTIONS = frozenset((
+    "format", "limit", "tid", "filter", "jobs", "engine-dir",
+    # the csv family: ours on the left, the exe's own flag in `_csv_*` below
+    "out", "json", "stat", "stats", "csvs", "dir", "pattern", "outlier-stat", "outlier-threshold",
+    "metadata-filter", "start-event", "in", "out-format", "compress", "set-metadata", "batch",
+    "list", "type", "graph-xml", "report-xml", "summary-formats", "thresholds", "base",
+    "dump-contents", "test-name", "delay", "stat-filter", "csv",
+))
+_BOOL_OPTIONS = frozenset((
+    "clear", "build", "force",
+    # the csv family
+    "quiet", "show-averages", "show-min", "show-max", "show-totals", "show-all-stats",
+    "show-events", "virtual-events", "verify", "in-place", "defaults", "recurse", "average",
+    "update",
+))
 
 _DEFAULT_PACKET_LIMIT = 40
 _DEFAULT_FRAME_LIMIT = 40
@@ -668,6 +688,372 @@ def cmd_cache(capture: str, args: List[str]) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- the CSV toolbox
+# The engine's executables, wrapped (README §2). Each subcommand builds one argv, runs one exe in a
+# scratch directory, prints the tool's own stdout as the answer and its identity on stderr, and
+# reports *skipped* (exit 2) when there is no engine tree -- never a silent pass.
+
+#: Our subcommand -> the executable in `<engine-dir>\Engine\Binaries\DotNET\CsvTools`.
+_CSV_EXES = {
+    "info": "csvinfo.exe",
+    "split": "CSVSplit.exe",
+    "convert": "CsvConvert.exe",
+    "filter": "CSVFilter.exe",
+    "collate": "CSVCollate.exe",
+    "svg": "CSVToSVG.exe",
+    "report": "PerfreportTool.exe",
+    "regressions": "RegressionsReport.exe",
+}
+
+#: The exe's own `Format:` banner, quoted by our usage errors so the contract is never guessed.
+_CSV_FORMATS = {
+    "info": "csv info <capture.csv> [--json FILE] [--stat-filter LIST] [--quiet] [--show ...]",
+    "split": "csv split <capture.csv> --stat NAME [--out FILE] [--delay N] [--virtual-events]",
+    "convert": "csv convert --in FILE --out-format csv|bin|csvNoMetadata [--out FILE] "
+               "[--compress 0|1|2] [--verify] [--force|--in-place] [--set-metadata k=v;...]",
+    "filter": "csv filter <capture.csv> (--stats LIST|--defaults) --out FILE",
+    "collate": "csv collate (--csvs LIST|--dir DIR) --out FILE [--pattern P] [--recurse] [--average] "
+               "[--outlier-stat S --outlier-threshold N] [--metadata-filter k=v] [--start-event E]",
+    "svg": "csv svg (--csvs LIST|--dir DIR) --stats LIST --out FILE [--batch FILE] [--update]",
+    "report": "csv report (--csv F|--dir D|--list L) --out DIR [--type T] [--graph-xml F] "
+              "[--report-xml F] [--summary-formats L]",
+    "regressions": "csv regressions <summary.csv> --out DIR --thresholds FILE [--base F] "
+                   "[--dump-contents F] [--test-name N]",
+    "from-trace": "csv from-trace <capture.utrace> --out FILE [--jobs N]",
+}
+
+
+def _csv_positional(args: Sequence[str], what: str) -> Tuple[str, List[str]]:
+    """Peel the first non-option argument (a CSV, a summary, a capture); the rest is options."""
+    for index, arg in enumerate(args):
+        if not arg.startswith("--"):
+            return arg, list(args[:index]) + list(args[index + 1:])
+    raise UsageError("csv needs a %s: %s" % (what, _CSV_FORMATS.get(what, "")))
+
+
+def _csv_argv(parts: Sequence[Optional[str]]) -> List[str]:
+    """Flags in the exe's own spelling: our `--outlier-stat` is its `-outlierStat`."""
+    return [str(part) for part in parts if part]
+
+
+def _csv_kv(option: str, value: str) -> List[str]:
+    return [option, value] if value else []
+
+
+def _csv_emit(lines: Sequence[str], code: int, verdict: bool = False) -> int:
+    """Our lines: a *verdict* (nothing to compare) is the answer and goes to stdout; a
+    diagnostic about a tool that ran goes to stderr, so stdout stays the tool's own."""
+    stream = sys.stdout if verdict else sys.stderr
+    for line in lines:
+        stream.write(line + "\n")
+    return code
+
+
+def _csv_engine(options: Options) -> Tuple[Optional[engine.EngineDir], List[str]]:
+    """The engine tree for this call, plus anything that has to be said out loud about it."""
+    notes: List[str] = []
+    return engine.resolve(options.text("engine-dir") or None, notes=notes), notes
+
+
+def _csv_skipped(exe_name: str, root: Optional[engine.EngineDir], notes: Sequence[str]) -> int:
+    lines = list(notes)
+    if root is None:
+        lines.append("csv      : skipped: no engine directory, so the CSV toolbox is not available")
+    else:
+        lines.append("csv      : skipped: %s has no %s" % (root.root.name or root.root, exe_name))
+    lines.append("hint     : " + engine.hint())
+    return _csv_emit(lines, 2, verdict=True)
+
+
+def _absolute(path: str) -> str:
+    return path if os.path.isabs(path) else str(Path(path).resolve())
+
+
+def _csv_run(exe_name: str, argv: List[str], options: Options,
+             expect: Sequence[str] = ()) -> int:
+    """Run one CsvTools executable and report the call: its stdout, our stamp, and the exit code.
+
+    The exe runs in a scratch directory, so its own temporary files never land in this repo -- which
+    is why every path in `argv` is made absolute first. `toolrun.run_tool` is what the tests patch:
+    the exes are the engine's, not ours, so their half of the suite is the *not compared* half.
+    """
+    root, notes = _csv_engine(options)
+    if root is None:
+        return _csv_skipped(exe_name, root, notes)
+    exe = root.csvtools(exe_name)
+    if exe is None:
+        return _csv_skipped(exe_name, root, notes)
+    with tempfile.TemporaryDirectory(prefix="ueia-csv-") as scratch:
+        result = toolrun.run_tool(exe, _csv_absolute(argv), cwd=Path(scratch))
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    for line in result.describe():
+        sys.stderr.write(line + "\n")
+    for line in notes:
+        sys.stderr.write(line + "\n")
+    lines: List[str] = []
+    for path in expect:
+        if not path:
+            continue
+        candidate = Path(path)
+        if candidate.is_file():
+            lines.append("wrote    : %s (%d bytes)" % (candidate, candidate.stat().st_size))
+    if result.exit != 0:
+        lines.append("error    : %s exited %d" % (exe_name, result.exit))
+        return _csv_emit(lines, 1)
+    return _csv_emit(lines, 0)
+
+
+def _csv_absolute(argv: Sequence[str]) -> List[str]:
+    """Paths become absolute: the tool runs in a scratch directory, the user's paths are theirs."""
+    out: List[str] = []
+    for index, item in enumerate(argv):
+        previous = argv[index - 1] if index else ""
+        if item.startswith("-"):
+            out.append(item)
+        elif previous in _CSV_PATH_FLAGS and not os.path.isabs(item):
+            out.append(str(Path(item).resolve()))
+        elif previous in _CSV_LIST_FLAGS:
+            out.append(";".join(
+                str(Path(part).resolve()) if part and not os.path.isabs(part) else part
+                for part in item.split(";")
+            ))
+        else:
+            out.append(item)
+    return out
+
+
+#: The exe flags whose value is a single path, and whose value is a `;`-separated path list.
+_CSV_PATH_FLAGS = frozenset(("-csv", "-csvDir", "-o", "-csvFile", "-thresholds", "-base",
+                             "-dumpContents", "-graphXML", "-reportXML", "-batchCommands", "-in"))
+_CSV_LIST_FLAGS = frozenset(("-csvs", "-csvList"))
+
+
+def _csv_info(args: List[str]) -> int:
+    """`csv info <capture.csv> [--json FILE] [--quiet] [--show ...]`: a CSV's shape and numbers."""
+    csv_path, rest = _csv_positional(args, "info")
+    options = parse_options(rest)
+    argv = [_absolute(csv_path)]
+    if options.is_set("quiet"):
+        argv.append("-quiet")
+    for flag, exe_flag in (("show-averages", "-showAverages"), ("show-min", "-showMin"),
+                           ("show-max", "-showMax"), ("show-totals", "-showTotals"),
+                           ("show-all-stats", "-showAllStats"), ("show-events", "-showEvents")):
+        if options.is_set(flag):
+            argv.append(exe_flag)
+    argv += _csv_kv("-statFilters", options.text("stat-filter"))
+    json_path = options.text("json")
+    if json_path:
+        argv += ["-toJson", str(Path(json_path).resolve())]
+        expect = [json_path]
+    else:
+        expect = []
+    return _csv_run(_CSV_EXES["info"], argv, options, expect)
+
+
+def _csv_split(args: List[str]) -> int:
+    """`csv split <capture.csv> --stat NAME [--out FILE]`: one CSV per value of a stat."""
+    csv_path, rest = _csv_positional(args, "split")
+    options = parse_options(rest)
+    if not options.text("stat"):
+        raise UsageError(_CSV_FORMATS["split"])
+    argv = ["-csv", _absolute(csv_path), "-splitStat", options.text("stat")]
+    argv += _csv_kv("-o", options.text("out"))
+    argv += _csv_kv("-delay", options.text("delay") or "")
+    if options.is_set("virtual-events"):
+        argv.append("-virtualEvents")
+    return _csv_run(_CSV_EXES["split"], argv, options, [options.text("out")])
+
+
+def _csv_convert(args: List[str]) -> int:
+    """`csv convert --in FILE --out-format FMT ...`: text ⇄ `.csv.bin`, metadata, integrity."""
+    options = parse_options(args)
+    if not options.text("in") or not options.text("out-format"):
+        raise UsageError(_CSV_FORMATS["convert"])
+    argv = ["-in", options.text("in"), "-outFormat", options.text("out-format")]
+    argv += _csv_kv("-o", options.text("out"))
+    argv += _csv_kv("-binCompress", options.text("compress"))
+    argv += _csv_kv("-setMetadata", options.text("set-metadata"))
+    if options.is_set("verify"):
+        argv.append("-verify")
+    if options.is_set("force"):
+        argv.append("-force")
+    if options.is_set("in-place"):
+        argv.append("-inPlace")
+    return _csv_run(_CSV_EXES["convert"], argv, options, [options.text("out")])
+
+
+def _csv_filter(args: List[str]) -> int:
+    """`csv filter <capture.csv> --stats LIST --out FILE`: only the wanted columns."""
+    csv_path, rest = _csv_positional(args, "filter")
+    options = parse_options(rest)
+    out = options.text("out")
+    if not out or not (options.text("stats") or options.is_set("defaults")):
+        raise UsageError(_CSV_FORMATS["filter"])
+    argv = ["-csv", _absolute(csv_path), "-o", out]
+    argv += _csv_kv("-stats", options.text("stats"))
+    if options.is_set("defaults"):
+        argv.append("-defaults")
+    return _csv_run(_CSV_EXES["filter"], argv, options, [out])
+
+
+def _csv_collate(args: List[str]) -> int:
+    """`csv collate (--csvs LIST|--dir DIR) --out FILE ...`: many CSVs into one table."""
+    options = parse_options(args)
+    out = options.text("out")
+    if not out or not (options.text("csvs") or options.text("dir")):
+        raise UsageError(_CSV_FORMATS["collate"])
+    argv: List[str] = []
+    argv += _csv_kv("-csvs", options.text("csvs"))
+    argv += _csv_kv("-csvDir", options.text("dir"))
+    argv += _csv_kv("-searchPattern", options.text("pattern"))
+    argv += _csv_kv("-filterOutlierStat", options.text("outlier-stat"))
+    argv += _csv_kv("-filterOutlierThreshold", options.text("outlier-threshold"))
+    argv += _csv_kv("-metadataFilter", options.text("metadata-filter"))
+    argv += _csv_kv("-startEvent", options.text("start-event"))
+    if options.is_set("recurse"):
+        argv.append("-recurse")
+    if options.is_set("average"):
+        argv.append("-avg")
+    argv += ["-o", out]
+    return _csv_run(_CSV_EXES["collate"], argv, options, [out])
+
+
+def _csv_svg(args: List[str]) -> int:
+    """`csv svg (--csvs LIST|--dir DIR) --stats LIST --out FILE`: the SVG graph renderer."""
+    options = parse_options(args)
+    argv: List[str] = []
+    argv += _csv_kv("-csvs", options.text("csvs"))
+    argv += _csv_kv("-csvDir", options.text("dir"))
+    argv += _csv_kv("-stats", options.text("stats"))
+    argv += _csv_kv("-batchCommands", options.text("batch"))
+    if options.is_set("update"):
+        argv.append("-updatesvg")
+    out = options.text("out")
+    if not out or not (options.text("csvs") or options.text("dir") or options.text("batch")):
+        raise UsageError(_CSV_FORMATS["svg"])
+    argv += ["-o", out]
+    return _csv_run(_CSV_EXES["svg"], argv, options, [out])
+
+
+def _csv_report_cmd(args: List[str]) -> int:
+    """`csv report (--csv F|--dir D|--list L) --out DIR ...`: the full report bundle."""
+    options = parse_options(args)
+    out = options.text("out")
+    if not out or not (options.text("csv") or options.text("dir") or options.text("list")):
+        raise UsageError(_CSV_FORMATS["report"])
+    argv: List[str] = []
+    argv += _csv_kv("-csv", options.text("csv"))
+    argv += _csv_kv("-csvDir", options.text("dir"))
+    argv += _csv_kv("-csvList", options.text("list"))
+    argv += _csv_kv("-reportType", options.text("type"))
+    argv += _csv_kv("-graphXML", options.text("graph-xml"))
+    argv += _csv_kv("-reportXML", options.text("report-xml"))
+    argv += _csv_kv("-summaryTableOutputFormats", options.text("summary-formats"))
+    argv += ["-o", out]
+    return _csv_run(_CSV_EXES["report"], argv, options)
+
+
+def _csv_regressions(args: List[str]) -> int:
+    """`csv regressions <summary.csv> --out DIR --thresholds FILE`: a threshold regression report."""
+    summary, rest = _csv_positional(args, "regressions")
+    options = parse_options(rest)
+    out = options.text("out")
+    thresholds = options.text("thresholds")
+    if not out or not thresholds:
+        raise UsageError(_CSV_FORMATS["regressions"])
+    argv = ["-csvFile", _absolute(summary), "-o", out, "-thresholds", thresholds]
+    argv += _csv_kv("-base", options.text("base"))
+    argv += _csv_kv("-dumpContents", options.text("dump-contents"))
+    argv += _csv_kv("-testName", options.text("test-name"))
+    return _csv_run(_CSV_EXES["regressions"], argv, options, [options.text("dump-contents")])
+
+
+def _csv_from_trace(args: List[str]) -> int:
+    """`csv from-trace <capture.utrace> --out FILE`: the bridge no engine exe offers.
+
+    Reads a capture's CSV Profiler definitions and per-frame values (which ride the `counters`
+    channel, REFERENCE §5) and writes the `.csv` the rest of this family reads, in the format
+    `CsvStats.ReadCSVFromLines` accepts. The cache does not hold the values, so this walks the
+    streams every time -- and when the capture has definitions but no values (no CSV capture was
+    running), that is *skipped* (exit 2) with the re-record line, not an empty file.
+    """
+    capture, rest = _csv_positional(args, "from-trace")
+    options = parse_options(rest)
+    out = options.text("out")
+    if not out:
+        raise UsageError(_CSV_FORMATS["from-trace"])
+    view = load_view(capture)
+    with timing.timed("streams"):
+        stream_set = streams.assemble(view.data, view.packets)
+    with timing.timed("model"):
+        model, _counts, _anomalies = build_model(stream_set, _jobs(options))
+    with timing.timed("csv"):
+        registry = schema.build_registry(
+            stream_set.streams.get(TID_EVENTS, b""), [], zero_counts(),
+        )
+        labels = {int(row["tid"]): str(row.get("name") or "") for row in model["threads"]}
+        values = csvprof.collect(
+            stream_set, registry, model["csv_stats"], model["csv_categories"], model["frames"],
+            dict(model["session"]), labels,
+        )
+    if not values["value_events"]:
+        return _csv_emit([
+            "capture  : %s" % (view.path.name,),
+            "stats    : %d definition(s), 0 value(s)" % (values["stat_count"],),
+            "csv      : skipped: this capture ran no CSV capture, so there are no per-frame values",
+            "hint     : record with the CSV profiler capturing (`CsvProfiler.Start`, or "
+            "-csvcapture) and trace the `counters` channel",
+        ], 2, verdict=True)
+    written = csvprof.write_csv(values, Path(out), csvprof.default_metadata(values, view.path.name))
+    return _csv_emit([
+        "capture  : %s" % (view.path.name,),
+        "stats    : %d definition(s), %d series" % (values["stat_count"], len(values["series"])),
+        "values   : %d event(s) over %d frame(s) from %s" % (
+            values["value_events"], len(values["frames"]), values["frames_from"],
+        ),
+        "dropped  : %d value(s) outside every frame" % (values["dropped"],),
+        "wrote    : %s (%d bytes)" % (out, written),
+    ], 0, verdict=True)
+
+
+_CSV_SUBCOMMANDS: Dict[str, Callable[[List[str]], int]] = {
+    "info": _csv_info,
+    "split": _csv_split,
+    "convert": _csv_convert,
+    "filter": _csv_filter,
+    "collate": _csv_collate,
+    "svg": _csv_svg,
+    "report": _csv_report_cmd,
+    "regressions": _csv_regressions,
+    "from-trace": _csv_from_trace,
+}
+
+
+def cmd_csv(args: List[str]) -> int:
+    """`csv <subcommand> ...`: the engine's CSV toolbox, wrapped (README §2).
+
+    Subcommands, 1:1 with the executables: `info`, `split`, `convert`, `filter`, `collate`, `svg`,
+    `report`, `regressions` -- each a thin invocation whose stdout is the answer, stamped on stderr
+    with the exe's identity and exact argv -- plus `from-trace`, the one thing no engine exe does:
+    synthesize a CSV Profiler `.csv` from a capture's own CSV Profiler events.
+
+    Exit codes: 0 the tool ran, 1 it failed (its own output is printed), 2 *skipped*: no engine
+    directory, or a tree without that executable. Nothing is ever re-derived in Python here.
+    """
+    if not args:
+        raise UsageError("csv needs a subcommand: %s" % (", ".join(sorted(_CSV_SUBCOMMANDS)),))
+    name = args[0]
+    handler = _CSV_SUBCOMMANDS.get(name)
+    if handler is None:
+        raise UsageError("unknown csv subcommand %r (try: %s)" % (
+            name, ", ".join(sorted(_CSV_SUBCOMMANDS)),
+        ))
+    return handler(args[1:])
+
+
 def cmd_lz4(args: List[str]) -> int:
     """`lz4 [--build] [--force]`: the decoder library, and building it.
 
@@ -800,6 +1186,7 @@ __all__ = [
     "cmd_verify",
     "cmd_parse",
     "cmd_cache",
+    "cmd_csv",
     "cmd_lz4",
     "cmd_selftest",
     "cmd_goldens",

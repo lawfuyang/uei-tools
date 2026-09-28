@@ -59,10 +59,17 @@ schema. The corpus rules are inherited from rdc-tools wholesale:
   files. A **CSV Profiler capture** (`-csvcapture`, `CsvProfiler.Start`, ...) is wanted too —
   see §2 for why.
 
-## 2. CsvTools — the engine's CSV toolbox, reused and never reimplemented (planned — ROADMAP §1)
+## 2. CsvTools — the engine's CSV toolbox, reused and never reimplemented (the `csv` family)
 
-Nothing in this section exists yet as a command; it is the contract the `csv` family will be
-built to. The engine ships its whole CSV Profiler toolchain as self-contained .NET executables under
+The `csv` family implements this contract: one subcommand per executable plus `from-trace`, each a
+thin invocation with the exe's own stdout as the answer. **How we call them, everywhere:** our flags
+map 1:1 onto the exe's own spelling (`csv info --json F` → `-toJson F`), every path is passed as an
+argument (never through a shell), the exe runs in a scratch directory so *its* temporary files never
+land in this repo, the tool's stdout is ours only to pass through, and the exe's identity
+(SHA-256 + size) and the exact argv go to **stderr** as the call's evidence. Exit codes: **0** the
+tool ran, **1** it failed (its own output is printed), **2** *skipped* — no engine directory, or a
+tree without that executable, with the hint. The engine ships its whole CSV Profiler toolchain as
+self-contained .NET executables under
 `<engine-dir>\Engine\Binaries\DotNET\CsvTools`. They are **the** answer for CSV statistics,
 filtering, splitting, collating, graphs and performance reports, and this repo's rule is:
 **wrap the executable, parse its output, cite it — never write our own version of what it
@@ -93,7 +100,7 @@ CSV Profiler-format `.csv` first — the channel carries the stat definitions
 (`RegisterCategory`, `DefineDeclaredStat`, `DefineInlineStat`) and, when a CSV capture was
 running, the per-frame values too (`BeginStat`/`EndStat`/`CustomStat`/`Event`/`Metadata`, see
 `REFERENCE.md`). The corpus capture has the definitions but no per-frame CSV events — a capture
-with a CSV capture running is wanted (ROADMAP §1, §14).
+with a CSV capture running is wanted (the `from-trace` bridge above, and ROADMAP §13).
 
 ## 3. What the engine already answers (and this tool does not rebuild)
 
@@ -137,6 +144,7 @@ three). Commands that need engine-provided tooling will take `--engine-dir` (or 
 | `verify <capture> [--jobs N]` | walks everything and reports what does not add up: packet and stream anomalies, schema redefinitions, serial gaps, unpaired frames, unknown bookmark points. **Exit 1** when anything error-level was found |
 | `parse <capture> [--jobs N]` | builds (and caches) the session model; prints what it holds |
 | `cache <capture> [--clear]` | the parse cache beside a capture: status, or remove it |
+| `csv <subcommand> ...` | the engine's CSV toolbox, wrapped (§2): `info` (a CSV's shape and numbers, `--json FILE` for the machine form), `split`, `convert`, `filter`, `collate`, `svg`, `report`, `regressions`, and `from-trace` — synthesize the CSV Profiler `.csv` from a capture's own CSV events, the bridge no engine exe offers. `--engine-dir DIR` or `$UEI_ENGINE_DIR`; exit **2** when there is no engine tree, never a silent pass |
 | `lz4 [--build] [--force]` | the LZ4 decoder: which library answered, its version, whether it matches the recipe that built it, and a decode of a known block as proof it works. `--build` compiles `bin/ueia_lz4.dll` when it is missing or stale (`--force` rebuilds either way). Exit 0 usable and current / 1 stale or broken / 2 nothing to decode with |
 | `selftest [-v] [-k PATTERN]` | the hermetic unit-test suite — no capture, no engine directory, no network. Exit 0 pass / 1 fail / 2 bad option |
 | `goldens [--check\|--write] [--capture KEY] [-v]` | the corpus: re-runs the pinned commands over the captures this machine has and compares. Exit 0 matched / 1 a problem / 2 nothing to compare |
@@ -148,7 +156,7 @@ worker processes) and a cached command 0.49 s. `--jobs N` sets how many processe
 use — `parse` and `verify` are the commands that walk — and `--jobs 0` (the default) chooses for
 the machine. It cannot change a byte of the output; the suite pins serial ≡ parallel.
 
-Planned (see `ROADMAP.md`): the `csv` family wrapping CsvTools (§2), then the summary layer with
+Planned (see `ROADMAP.md`): the summary layer with
 frame-time budgets, percentiles and hitch tables, bottleneck classification (CPU/GPU/display),
 the timer **call tree** and self time, thread occupancy, the critical path / task graph, source
 mapping, a `coverage` command that says whether a capture can answer a question at all, GPU /

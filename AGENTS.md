@@ -92,6 +92,18 @@ fixture traces are built in memory in `tests/`. Wrapped exes are stubbed with a 
 for the same reason. Checks that *do* need this machine's captures or a real engine directory
 are the goldens half, reported separately, where "not compared" is never "pass".
 
+## Engine tooling: one way in, and it is a flag
+
+`--engine-dir <dir>` (or `$UEI_ENGINE_DIR`) is the *only* way any command finds engine-provided
+tooling — the CsvTools executables, later the engine's trace programs, and `Build.version` for a
+report's meta (the contract is `engine.py`). A **flag** naming something that is not an engine tree
+is a usage error: naming the wrong directory is a mistake, not an absence. A **variable** naming one
+is reported and ignored, because an ambient setting must never change behaviour quietly. Nothing
+named at all is legal, and then the commands that need tooling report **skipped** (exit 2) with the
+hint — the same "nothing to compare" rule as the corpus half. Every wrapped call records the exe's
+SHA-256 and exact argv (`toolrun.py`), because the unwrapped tool is the authority and our output
+has to say which build answered.
+
 ## Channels: absent is not zero
 
 A capture carries only what it was recorded with (the channel inventory is REFERENCE §8): a trace
@@ -99,7 +111,7 @@ without `gpu` cannot answer a GPU question, one without `memtag`/`memalloc` cann
 question, and one without `task` cannot show a critical path. An analysis whose channel is missing
 reports **skipped** with the re-record line, never zero, never a default and never a guess — the
 same rule as the corpus half's exit 2, one level down. Every analysis that lands says in its tests
-what it does with its channel absent, and `coverage` (ROADMAP §10) is the one command that has to
+what it does with its channel absent, and `coverage` (ROADMAP §9) is the one command that has to
 get this right for all of them at once.
 
 ## Parallel work (the one place processes are used)

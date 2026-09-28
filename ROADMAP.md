@@ -1,13 +1,17 @@
 # uei-tools — build roadmap / TODO
 
-**Status (2026-09-28):** the parser core landed and left this file — it is implemented in `src/py/`,
-covered by **175 hermetic unit tests** (`selftest`), clean under Pyright (0 errors, 0 warnings), and
+**Status (2026-09-28):** the parser core and the CsvTools integration have landed and left this
+file — `src/py/` is covered by **210 hermetic unit tests** (`selftest`; the engine-toolbox half
+skips, loudly, on a machine without an engine tree), clean under Pyright (0 errors, 0 warnings), and
 verified against the corpus capture (`editor-pie-1`): `goldens --check` compares the pinned commands'
 *real* output and matches, and `verify` reports 0 errors over 163,600 packets / 960,142 events /
 10,055,971 batch records with a gapless serial range. The LZ4 decoder is the C library this repo
 vendors and builds (`ueia lz4 --build`, gate step 0), the per-thread walk runs over worker processes
-(`--jobs`), and a cold full decode of the corpus is **5.2 s** (REFERENCE §6). The command list is in
-`README.md` §4; the format facts it measured are in `REFERENCE.md`.
+(`--jobs`), and a cold full decode of the corpus is **5.2 s** (REFERENCE §6). The CSV toolbox is
+wrapped behind `ueia csv` (`--engine-dir` / `$UEI_ENGINE_DIR`), with the one bridge no engine exe
+offers — `csv from-trace` — writing the format the engine's own readers parse; `csv info` on a
+synthesized file is the acceptance test. The command list is in `README.md` §3; the format facts it
+measured are in `REFERENCE.md`.
 
 Landed items are *removed* rather than ticked off, and the remaining sections renumbered with
 their cross-references updated in the same change (the
@@ -63,18 +67,18 @@ CI](https://bugnet.io/blog/how-to-test-game-performance-regression-in-ci)
 
 | The practice's step | The data it needs | In a `.utrace` | Lands in |
 |---|---|---|---|
-| Budget verdict (30/60/120 FPS) | per-frame times | `Misc.BeginFrame`/`EndFrame` pairs, `session.cycle_frequency` | §2 |
-| Hitch hunting | the tail, not the mean | the frame-time distribution + what ran in the worst frames | §2 |
-| CPU / GPU / display-bound | CPU frame time vs GPU busy | game/render/RHI thread scopes + the `gpu` channel | §3, §11 |
-| CPU root cause | inclusive vs self time, call tree | the timer scopes whose nesting is already decoded | §9 |
-| Threading / parallelism | occupancy, waits, critical path | batch records, `task`, thread-idle scopes | §5, §9 |
-| GPU root cause | per-pass and per-draw cost | `gpu` channel (`GpuProfiler`) | §11 |
-| Memory questions | LLM tags, allocations, sites | `memtag`, `memalloc`, `callstack`, `module` | §12 |
-| Streaming hitches | load trees, IO waits | `loadtime`, `asset`, `file`, `iostore` | §13 |
-| The engine's own stat numbers | `stat` values per frame | `stats`, `counters` (+ CSV values via §1) | §14 |
-| Comparable captures | scene hygiene, channels, run-to-run noise | capture metadata, channel coverage, variance | §10 |
-| Build-to-build gating | p95/p99 + hitch count, rolling baseline | two analyses of the same scene | §8 |
-| "So what do I do?" | ranked, evidenced actions | all of the above | §7 |
+| Budget verdict (30/60/120 FPS) | per-frame times | `Misc.BeginFrame`/`EndFrame` pairs, `session.cycle_frequency` | §1 |
+| Hitch hunting | the tail, not the mean | the frame-time distribution + what ran in the worst frames | §1 |
+| CPU / GPU / display-bound | CPU frame time vs GPU busy | game/render/RHI thread scopes + the `gpu` channel | §2, §10 |
+| CPU root cause | inclusive vs self time, call tree | the timer scopes whose nesting is already decoded | §8 |
+| Threading / parallelism | occupancy, waits, critical path | batch records, `task`, thread-idle scopes | §4, §8 |
+| GPU root cause | per-pass and per-draw cost | `gpu` channel (`GpuProfiler`) | §10 |
+| Memory questions | LLM tags, allocations, sites | `memtag`, `memalloc`, `callstack`, `module` | §11 |
+| Streaming hitches | load trees, IO waits | `loadtime`, `asset`, `file`, `iostore` | §12 |
+| The engine's own stat numbers | `stat` values per frame | `stats`, `counters` (+ CSV values via §1) | §13 |
+| Comparable captures | scene hygiene, channels, run-to-run noise | capture metadata, channel coverage, variance | §9 |
+| Build-to-build gating | p95/p99 + hitch count, rolling baseline | two analyses of the same scene | §7 |
+| "So what do I do?" | ranked, evidenced actions | all of the above | §6 |
 
 ## The language decision (2026-09-28, kept honest by a measurement)
 
@@ -110,7 +114,7 @@ faster, rather than a matter of taste.
 ### Python, C++, or the engine's own tools? (asked 2026-09-28, answered here)
 
 **Every analysis stays in Python; native code is only ever *wrapped*, and only where the engine
-already answers.** The data is parsed once (REFERENCE §2–§5) and everything above it is
+already answers.** The data is parsed once (REFERENCE §2–§4) and everything above it is
 aggregation, which is what Python is for; the single native piece we own is the LZ4 DLL.
 What the engine's tree offers instead (found in this checkout, 2026-09-28 — REFERENCE §9 lists the
 files):
@@ -147,38 +151,7 @@ scope and named in "what is deliberately *not* on this list".
 
 ---
 
-## 1. P0 — CsvTools integration and the `--engine-dir` contract (~1–2 d)
-
-The engine already ships the CSV Profiler toolbox as .NET executables under
-`<engine-dir>\Engine\Binaries\DotNET\CsvTools` — **we wrap them, we do not reimplement them**
-(README §2 lists each exe, its arguments and how we use it). This phase makes that real:
-
-* **The flag.** `--engine-dir <dir>` (env `UEI_ENGINE_DIR`) is the one way any command finds
-  engine-provided tooling: the CsvTools exes, the trace programs of §9's table (REFERENCE §9), the
-  source tree for module/source mapping, and `Engine\Build\Build.version` for the report's `meta`.
-  Resolution order, validation (the exes exist and run), and the *skipped* convention when it is
-  absent (never a silent pass) are all part of this item.
-* **A wrapper module.** One place that runs an exe with `subprocess` — argument list, never
-  `shell=True`; stdout/stderr/exit code always captured; a timeout; scratch working directory;
-  paths with spaces quoted correctly (the corpus path has spaces; so does the engine's, by
-  default, so this bug would otherwise arrive immediately). Every wrapped call records the
-  exe's version and exact argv in our output.
-* **The CLI surface**, 1:1 with the exes plus the trace bridge: `csv info` (`csvinfo -toJson`,
-  parsed), `csv split`, `csv convert` (text ⇄ `.csv.bin`), `csv filter`, `csv collate`,
-  `csv svg` (`CSVToSVG`), `csv report` (`PerfreportTool`, summary tables as csv/json), and
-  `csv regressions` (`RegressionsReport`).
-* **`csv from-trace`** — synthesize a CSV Profiler-format `.csv` from a trace's CSV Profiler
-  events (which ride the `counters` channel, REFERENCE §8), so a capture (not just a CSV file) can
-  drive the whole pipeline. The corpus has the definitions but no per-frame values (REFERENCE §5),
-  so **obtain a capture with a CSV capture running**, or a raw `.csv`/`.csv.bin` pair, and make it
-  corpus key two.
-* **Outputs fold into ours**: the report bundle gains a CSV section — `csvinfo`'s JSON summary,
-  `PerfreportTool`'s summary tables, the generated SVGs — each stamped with the exe version and
-  argv it came from. Raw pass-through is available too (the wrapped output *is* the answer).
-* **Gates**: hermetic tests stub the exes (a fake exe fixture), so the suite needs no engine
-  dir; the real-exe half reports *not compared* (exit 2 convention) when there is none.
-
-## 2. P0 — the summary layer: budgets, distribution, hitches (~2 d)
+## 1. P0 — the summary layer: budgets, distribution, hitches (~2 d)
 
 Session overview (duration, frame count) and the frame-time **distribution**: mean, p50, p95,
 p99, max and a histogram — measured against an explicit budget (`--budget 60` FPS, or
@@ -188,7 +161,7 @@ naming what ran in it. The CI practice above is the spec: percentiles plus a **h
 50 ms spikes feels terrible. `TimingInsights.ExportTimerStatistics` is the minimum bar — our
 numbers must agree with its columns where they overlap.
 
-## 3. P1 — bottleneck classification (~1 d)
+## 2. P1 — bottleneck classification (~1 d)
 
 CPU-, GPU- or display-bound, per frame and aggregate, with confidence and the ranked "why is
 this frame slow" evidence (game thread vs render thread vs RHI vs GPU queue). The practice
@@ -196,7 +169,7 @@ decides this *before* drilling anywhere, so it is one of the first things every 
 when the capture has no `gpu` channel the honest answer is "GPU unknown here" plus the re-record
 line, never a CPU-bound claim (the corpus is exactly that case, REFERENCE §6).
 
-## 4. P1 — critical path / task graph (~2–3 d)
+## 3. P1 — critical path / task graph (~2–3 d)
 
 TaskGraph / ParallelFor / async timing events → dependency graph, critical path (longest chain),
 hot paths on it, exported as DOT/Mermaid + JSON. This is the flagship analysis and the one with
@@ -204,7 +177,7 @@ the least prior art to validate against — its claims carry confidence scores. 
 has **no TaskGraph events** (REFERENCE §6), so a capture with them is needed before this item
 can be tested against anything real.
 
-## 5. P1 — parallelism findings, from occupancy (~2 d)
+## 4. P1 — parallelism findings, from occupancy (~2 d)
 
 Occupancy first, because that is what the practice measures: per thread, **busy vs idle vs
 unaccounted** per frame, from the scope timeline and the batch records — the corpus already shows
@@ -212,7 +185,7 @@ the shape (tid 2 holds 53.4% of the records, so even the walk is lopsided). Then
 serial regions on the game thread with no dependencies, ParallelFor candidates, lock contention
 and oversubscription, each with an estimated speedup labelled as the heuristic it is.
 
-## 6. P2 — source mapping (~1 d)
+## 5. P2 — source mapping (~1 d)
 
 Timer → file:line is already in the trace (4,879 of the corpus's 27,760 timer specs carry one,
 REFERENCE §3); map into engine-vs-game by module using the engine tree (from `--engine-dir`)
@@ -220,7 +193,7 @@ and the project source, and cross-reference known UE anti-patterns (heavy Tick w
 during hitches...). The engine tree is optional: without it, report "module unknown" rather
 than guessing.
 
-## 7. P2 — recommendations engine + rules (~2 d)
+## 6. P2 — recommendations engine + rules (~2 d)
 
 Rule-based findings (JSON, droppable by the user) producing the ranked impact/effort/confidence
 list, each entry carrying its evidence, the file:line where the trace has one, and **the next
@@ -230,7 +203,7 @@ idle while the game thread is busy → parallelism; a hitch full of `AsyncLoadin
 streaming; missing channels → the re-record line. Anti-patterns come from the engine's guidance
 and from the corpus, and CsvTools outputs are cited as evidence where they answer.
 
-## 8. P1 — compare, and the CI gate (~2 d)
+## 7. P1 — compare, and the CI gate (~2 d)
 
 A/B of two cached analyses (before/after a change, two configurations, two builds), section by
 section — and the gate the practice describes: per capture and per scene, compare mean/p95/p99
@@ -242,7 +215,7 @@ Gauntlet/`AutomatedPerfTesting` runs (we consume their `.utrace` + `.csv`, we do
 their runner). The self-compare of one trace against itself must produce an empty diff (the
 rdc-tools A/B honesty check).
 
-## 9. P1 — the call tree and self time (~2 d)
+## 8. P1 — the call tree and self time (~2 d)
 
 The CPU root-cause step, and the biggest gap in what the model holds today: the scopes are
 counted, but their **cycles are discarded**, so "which timer owns this frame" cannot be answered
@@ -251,7 +224,7 @@ yet. Record the per-scope begin/end per thread (the framing already carries them
 attribution ("timer X owns 31% of frame 4121") and a callee expansion — which is also what
 `TimingInsights.ExportTimerCallees` exports, so it can be cross-checked column by column.
 
-## 10. P1 — coverage and capture hygiene (`coverage`) (~1 d)
+## 9. P1 — coverage and capture hygiene (`coverage`) (~1 d)
 
 The practice's first two steps, as one command: **which channels this capture carries**, which
 analyses each one enables (REFERENCE §8), what is *missing* (`gpu`, `memory`, `task`, ...) with
@@ -262,14 +235,14 @@ whether a warm-up window should be trimmed, and how noisy the distribution is (r
 variance when several captures are given). Every analysis that needs an absent channel then
 reports **skipped** (the exit-2 convention, per channel), never zero.
 
-## 11. P2 — GPU passes and the queue (~2 d)
+## 10. P2 — GPU passes and the queue (~2 d)
 
 The `gpu` channel (`GpuProfiler`): per-pass and per-queue timings, the per-frame GPU total, the
-GPU-bound confirmation for §3, top passes with their evidence, and queue-vs-CPU synchronisation
+GPU-bound confirmation for §2, top passes with their evidence, and queue-vs-CPU synchronisation
 (where the game thread waits on the GPU). Needs a capture with the channel; the corpus has none,
 so this item starts by acquiring one.
 
-## 12. P2 — memory (~2–3 d)
+## 11. P2 — memory (~2–3 d)
 
 The `memtag` (LLM tag values), `memalloc` (allocations, sizes, lifetimes) and `callstack`/
 `module` channels: peaks and growth per frame and per region, allocation churn, the top sites by
@@ -279,14 +252,14 @@ memory-into-hitch correlation (a full LLM tag list is also what tells a budget s
 pool, audio, physics). The engine's own implementation to mirror field by field is
 `TraceServices\Private\Analyzers\MemoryAnalysis.cpp` / `AllocationsAnalysis.cpp` (REFERENCE §8).
 
-## 13. P2 — loading and streaming (~2 d)
+## 12. P2 — loading and streaming (~2 d)
 
 The `loadtime`, `asset`, `file` and `iostore` channels: load-time trees per request group,
 the slowest packages and assets, IO wait vs CPU work, and — the money shot — **hitch frames
 correlated with load/streaming scopes** ("the hitch is a synchronous load in `GameThread`").
 Mirrors `LoadTimeTraceAnalysis.cpp` and `PlatformFileTraceAnalysis.cpp` (REFERENCE §8).
 
-## 14. P2 — stats and counters as time series (~1–2 d)
+## 13. P2 — stats and counters as time series (~1–2 d)
 
 The `stats` and `counters` channels carry the same numbers a `stat` HUD shows (and the CSV
 Profiler's values, which ride `counters`): per-frame series per stat, trends, worst frames per
@@ -295,7 +268,7 @@ values can be exported as a CSV Profiler `.csv` and driven through the CsvTools 
 The corpus carries counters and CSV *definitions* but no CSV values, so corpus key two (a
 capture with a CSV capture running) is shared with §1.
 
-## 15. P3 — the long tail
+## 14. P3 — the long tail
 
 `explain` deep-dive mode on one timer/frame range; raw JSONL export for further agent
 processing; agent-facing schema docs; anomaly detection across frames; `region`/`screenshot`/
