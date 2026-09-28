@@ -1,0 +1,34 @@
+{
+  "capture": {
+    "key": "game-pc-2",
+    "sha256": "C431814A9821D4B188266C4A887A03E662C53130A1AD542A341717E6D3168B1B",
+    "size": 13018825
+  },
+  "facts": {
+    "events_stream_packets": 9,
+    "importants_stream_packets": 641,
+    "magic": "2CRT",
+    "packet_anomalies": 0,
+    "packets": 42864,
+    "packets_lz4": 13062,
+    "packets_raw": 29799,
+    "packets_sync": 3,
+    "payload_bytes": 28552941,
+    "protocol": 7,
+    "schema_records": 35,
+    "schema_redefinitions": 0,
+    "schema_types": 35,
+    "size": 13018825,
+    "stream_anomalies": 0,
+    "threads_with_packets": 136,
+    "tids": 139,
+    "top_tid_packets": {
+      "139": 2274,
+      "140": 3309,
+      "149": 1976,
+      "151": 1968,
+      "2": 4232
+    },
+    "transport": 4
+  }
+}

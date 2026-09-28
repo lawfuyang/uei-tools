@@ -12,9 +12,11 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, TypedDict
 
 TOOL_NAME = "ueia"
 #: 0.2.0 added `frame_work` to the model (the per-frame work attribution the summary reports).
-#: The cache is keyed by this string, so the bump is what stops a model built by 0.1.0 -- which has
-#: no frame work in it -- from being read back and reported as a capture that had none.
-TOOL_VERSION = "0.2.0"
+#: 0.3.0 added the frame occupancy (`covered_cycles`/`wait_cycles`), the decoded GPU frames and the
+#: GPU specs -- the bottleneck verdict's inputs. The cache is keyed by this string, so the bump is
+#: what stops a model built by an older version, which has none of those, from being read back and
+#: reported as a capture that had no occupancy and no GPU work.
+TOOL_VERSION = "0.3.0"
 CACHE_FORMAT = 1
 
 MAGIC = b"2CRT"
@@ -231,13 +233,27 @@ class ThreadRow(TypedDict):
 
 
 class FrameRow(TypedDict):
-    """One frame: a BeginFrame/EndFrame pair of one frame type on one thread."""
+    """One frame: a BeginFrame/EndFrame pair of one frame type on one thread.
+
+    `covered_cycles` and `wait_cycles` are the frame's **occupancy** -- the cycles of this frame's
+    window the frame's own thread spent inside a `CpuProfiler` scope (any depth, overlapping scopes
+    merged), and the part of that spent inside a scope whose name reads as a wait
+    (`model.WAIT_NAME_MARKERS`: `WaitForTasks`, `WaitForGPU`, ...). Coverage is what answers "was
+    this thread doing anything during this frame", and the wait split is what stops a thread that is
+    *waiting* from reading as a thread that is *working* -- the corpus's render thread is inside
+    scopes for 97% of its frames, and 99.7% of that is `WaitForTasks`.
+
+    Both are None when the capture declared no timer specs: nothing could be attributed, which is
+    **not** the same as zero coverage, and a report must be able to tell those apart.
+    """
 
     index: int
     type: int
     tid: int
     begin_cycle: int
     end_cycle: int
+    covered_cycles: Optional[int]
+    wait_cycles: Optional[int]
 
 
 class FrameWorkRow(TypedDict):
@@ -263,6 +279,43 @@ class FrameWorkRow(TypedDict):
     cycles: int
     pairs: int
     items: List[Tuple[int, int]]
+
+
+class GpuSpecRow(TypedDict):
+    """One GPU timer spec: the id a frame's batch refers to, and the name it stands for.
+
+    The legacy `GpuProfiler` channel (the one the corpus carries, and the one UE 5.8.3 still
+    decodes for old traces -- `OldGpuProfilerTraceAnalysis.cpp`) names its events through
+    `GpuProfiler.EventSpec`, an important event whose `EventType` is an opaque uint32 id.
+    """
+
+    id: int
+    name: str
+
+
+class GpuFrameRow(TypedDict):
+    """One rendered frame as the GPU saw it: how long the GPU was busy, and on what.
+
+    `busy_us` is the sum of the frame batch's **outermost** GPU event durations -- outermost spans
+    cannot overlap, so their sum is the union: the time the GPU was executing traced work in that
+    frame. `passes` is the same idea per spec, biggest first, and `depth` is how deeply the batch
+    nested (a sanity number: a wrong decoder leaves events open, which `unbalanced` counts).
+
+    `unbalanced` and `truncated` are the row's own honesty: a batch whose events do not close, whose
+    varint runs off the end, or which claims an implausible duration (`gpu.MAX_FRAME_US`) has no
+    usable busy time, and `bottleneck` ignores exactly the rows whose counters are not zero rather
+    than reading them as a fast frame.
+    """
+
+    tid: int
+    number: int
+    base_us: int
+    busy_us: int
+    events: int
+    depth: int
+    unbalanced: int
+    truncated: int
+    passes: List[Tuple[int, int]]
 
 
 class BookmarkRow(TypedDict):

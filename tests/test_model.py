@@ -302,23 +302,41 @@ class TestFrameWork(UeiaTestCase):
             (60000, 2, [(7, 45000), (8, 20000)]),
             "45 ms of Tick containing 20 ms of FrameTime, inclusive both",
         )
-        self.assertEqual((work[1000000]["cycles"], work[1000000]["items"]), (20000, [(8, 8000)]))
+        self.assertEqual(
+            (work[1000000]["cycles"], work[1000000]["items"]),
+            (20000, [(8, 8000), (9, 6000)]), "8 ms of FrameTime, then 6 ms of WaitForTasks",
+        )
         self.assertEqual((work[1080000]["items"], work[1080000]["pairs"]), ([], 0))
         self.assertEqual(
             (counts["scope_pairs"], counts["scope_pairs_spanning"], counts["scope_pairs_no_spec"],
-             counts["scope_ends_unpaired"], counts["scope_begins_unpaired"]),
-            (3, 0, 0, 0, 0),
+             counts["scope_pairs_unframed"], counts["scope_ends_unpaired"],
+             counts["scope_begins_unpaired"]),
+            (4, 0, 0, 0, 0, 0),
         )
+        occupancy = {row["begin_cycle"]: (row["covered_cycles"], row["wait_cycles"])
+                     for row in model["frames"]}
+        self.assertEqual(occupancy[1000000], (14000, 6000),
+                         "8 + 6 ms covered, of which the 6 is the wait")
+        self.assertEqual(occupancy[1020000], (45000, 0), "one nested pair, no wait")
+        self.assertEqual(occupancy[1080000], (0, 0), "a frame with no scopes at all")
+        self.assertEqual(occupancy[1088000], (0, 0))
 
-    def test_a_pair_that_began_before_the_frame_is_counted_not_attributed(self) -> None:
+    def test_a_pair_that_began_before_the_frame_is_credited_with_the_part_inside_it(self) -> None:
+        """A scope that spans a frame edge is clipped, not dropped and not counted whole.
+
+        This is the normal shape of an enclosing scope (`RenderingFrame`, `FEngineLoop::Tick`), so
+        what the frame gets is the cycles the scope *ran inside that frame* -- and the pair is
+        counted as spanning, which is how a reader knows the numbers are clipped.
+        """
         stream = (
             _batch_event([(900000, 7, True)])
             + _frame_pair(1000000, 1020000, 1, body=_batch_event([(1010000, None, False)]))
         )
         model, counts = self._model(self._trace({2: stream}))
         self.assertEqual(counts["scope_pairs_spanning"], 1)
-        self.assertEqual(counts["scope_pairs"], 0, "the frame is not credited with it")
-        self.assertEqual(model["frame_work"][0]["items"], [])
+        self.assertEqual(counts["scope_pairs"], 1, "the part inside the frame is credited")
+        self.assertEqual(model["frame_work"][0]["items"], [(7, 10000)], "1,000,000 to 1,010,000")
+        self.assertEqual(model["frames"][0]["covered_cycles"], 10000)
 
     def test_a_pair_with_an_undeclared_spec_is_counted(self) -> None:
         stream = _frame_pair(
@@ -422,12 +440,18 @@ class TestFrameWork(UeiaTestCase):
         rows, _anomalies = container.walk_packets(data, container.parse_header(data))
         stream_set = streams.assemble(data, rows)
         registry = schema.build_registry(stream_set.streams[0], [], zero_counts())
-        share = _walk_tid(2, stream_set.streams[2], registry, {}, 0)
+        share = _walk_tid(2, stream_set.streams[2], registry, {})
         self.assertEqual(share["frame_work"], [], "no timer specs, no attribution")
         self.assertEqual(share["counts"]["scope_pairs"], 0)
         self.assertEqual(len(share["frames"]), 4, "the frames themselves are still paired")
-        with_specs = _walk_tid(2, stream_set.streams[2], registry, {}, 9)
+        self.assertEqual([row["covered_cycles"] for row in share["frames"]],
+                         [None] * 4, "and no occupancy either: not zero, unknown")
+        with_specs = _walk_tid(2, stream_set.streams[2], registry, {}, bytes(9))
         self.assertEqual(len(with_specs["frame_work"]), 4)
+        self.assertEqual([row["covered_cycles"] for row in with_specs["frames"]],
+                         [14000, 45000, 0, 0],
+                         "this time every frame was measured: 8 + 6 ms in the first, 45 ms of Tick "
+                         "(with FrameTime inside it) in the second, nothing in the last two")
 
     def _trace(self, threads: Dict[int, bytes]) -> bytes:
         return build_trace(
@@ -484,14 +508,14 @@ class TestParallelWalk(UeiaTestCase):
     def test_the_worker_walks_one_unit_exactly_as_the_serial_walk_does(self) -> None:
         stream_set = self._stream_set()
         registry = self._registry(stream_set)
-        _worker_init(registry, {}, _SPEC_COUNT)
+        _worker_init(registry, {}, bytes(_SPEC_COUNT))
         self.addCleanup(_CONTEXT.clear)
         share = _worker_walk((2, stream_set.streams[2]))
-        here = _walk_tid(2, stream_set.streams[2], registry, {}, _SPEC_COUNT)
+        here = _walk_tid(2, stream_set.streams[2], registry, {}, bytes(_SPEC_COUNT))
         self.assertEqual(share, here)
         self.assertGreater(share["row"]["events"], 0)
         # the initargs have to cross a process boundary, so unpicklable is a build failure
-        pickle.dumps((registry, {}, _SPEC_COUNT))
+        pickle.dumps((registry, {}, bytes(_SPEC_COUNT)))
 
     def test_jobs_one_and_jobs_two_write_the_same_bytes(self) -> None:
         stream_set = self._stream_set()

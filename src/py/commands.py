@@ -22,6 +22,7 @@ import unittest
 from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
 
+import bottleneck
 import cache
 import container
 import csvprof
@@ -594,6 +595,11 @@ def cmd_summary(capture: str, args: List[str]) -> int:
         distribution["p95_ms"], distribution["p99_ms"], distribution["max_ms"],
     ))
     lines.append("verdict   : %s" % (summary.verdict_text(distribution, budget),))
+    report, reasons = bottleneck.classify(model, budget, series.tid)
+    if report is None:
+        lines.append("bottleneck: cannot be decided here -- %s" % ("; ".join(reasons),))
+    else:
+        lines.append("bottleneck: %s" % (bottleneck.verdict_text(report),))
     lines.append("histogram :")
     lines.extend(summary.histogram_lines(summary.histogram(times, budget.ms)))
     lines.append("work      : %d scope pair(s) attributed (%d spanning a frame edge, %d with no "
@@ -630,6 +636,87 @@ def cmd_summary(capture: str, args: List[str]) -> int:
         ("frame", "at s", "ms", "x budget", "top work"),
         rows,
         (True, True, True, True, False),
+        options.fmt(),
+        lines,
+    )
+    return 0
+
+
+def cmd_bottleneck(capture: str, args: List[str]) -> int:
+    """`bottleneck <capture> [--budget FPS|--budget-ms MS] [--tid N] [--limit N]`: what bounds a frame?
+
+    The first question the practice asks: is this frame bound by the game thread, the render thread,
+    the GPU -- or by none of them (a wait, a cap, or something this capture cannot see)? Every
+    verdict is a measurement against the budget: the thread's own non-wait scope coverage, the
+    sibling series' coverage inside the same frame, and the GPU's busy time when the capture carries
+    the legacy GPU channel. The rule from ROADMAP §1 is enforced in the output: a capture with no
+    GPU data gets its CPU finding *plus* "the GPU side is unknown here" and the re-record line, never
+    a bare "CPU-bound".
+
+    Exit codes: 0 classified, 2 the capture cannot answer (no frame pairs, no cycle frequency, no
+    timer specs), 1 a failure.
+    """
+    options = parse_options(args)
+    if options.values.keys() - {"budget", "budget-ms", "tid", "limit", "format", "jobs"} \
+            or options.flags:
+        raise UsageError(
+            "bottleneck takes --budget, --budget-ms, --tid, --limit, --format and --jobs"
+        )
+    budget = summary.parse_budget(options.values.get("budget"), options.values.get("budget-ms"))
+    limit = options.number("limit", _DEFAULT_BREAKER_LIMIT)
+    tid = options.number("tid", -1)
+    view, model, _cached = load_model(capture, _jobs(options))
+    report, notes = bottleneck.classify(model, budget, None if tid < 0 else tid)
+    session = model.get("session", {})
+    duration = seconds_for_cycle(model, int(session.get("last_cycle", 0)))
+    lines: List[str] = []
+    if report is None:
+        lines.append("capture   : %s" % (view.path.name,))
+        for note in notes:
+            lines.append("cannot    : %s" % (note,))
+        lines.append("hint      : `bottleneck` needs frame pairs, a cycle frequency and "
+                     "CpuProfiler scopes in the same capture")
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        return 2
+    lines.append("capture   : %s%s" % (
+        view.path.name, ", %.3f s" % (duration,) if duration is not None else "",
+    ))
+    lines.append("frames    : %s, spanning %s" % (
+        report.series.describe(),
+        "%.3f s" % (report.series.span_s,) if report.series.span_s is not None else "?",
+    ))
+    lines.append("budget    : %s" % (budget.label(),))
+    lines.append("verdict   : %s" % (bottleneck.verdict_text(report),))
+    for role in report.roles:
+        lines.append("thread    : tid %d %s (%s, heuristic) -- %d frame(s), %d over budget" % (
+            role.tid, role.name or "unnamed", role.role, role.frames, role.over_budget,
+        ))
+    if report.gpu_present:
+        lines.append("gpu       : %d frame(s) decoded from the capture's GpuProfiler channel" % (
+            len([row for row in model.get("gpu_frames", []) if isinstance(row, dict)]),
+        ))
+    for note in report.notes:
+        lines.append("note      : %s" % (note,))
+    ordered = sorted(report.verdicts, key=lambda item: (-item.milliseconds,
+                                                        int(item.frame["begin_cycle"])))
+    shown = ordered if limit == 0 else ordered[:limit]
+    rows: List[Tuple[str, ...]] = []
+    for verdict in shown:
+        at = seconds_for_cycle(model, int(verdict.frame.get("begin_cycle", 0)))
+        rows.append((
+            str(verdict.frame.get("index", 0)),
+            "-" if at is None else "%.3f" % (at,),
+            "%.3f" % (verdict.milliseconds,),
+            verdict.verdict,
+            "-" if verdict.work_ms is None else "%.3f" % (verdict.work_ms,),
+            "-" if verdict.gpu_ms is None else "%.3f" % (verdict.gpu_ms,),
+            bottleneck.evidence_text(model, verdict),
+        ))
+    render_rows(
+        ("frame", "at s", "ms", "verdict", "work ms", "gpu ms", "why / what ran in it"),
+        rows,
+        (True, True, True, False, True, True, False),
         options.fmt(),
         lines,
     )
@@ -702,10 +789,18 @@ def cmd_verify(capture: str, args: List[str]) -> int:
     if model.get("frames"):
         lines.append(
             "work      : %d scope pair(s) attributed to frames (%d spanning a frame edge, %d with "
-            "no spec), %d unpaired end(s), %d unpaired begin(s)" % (
+            "no spec, %d in no frame window), %d unpaired end(s), %d unpaired begin(s)" % (
                 counts.get("scope_pairs", 0), counts.get("scope_pairs_spanning", 0),
-                counts.get("scope_pairs_no_spec", 0), counts.get("scope_ends_unpaired", 0),
-                counts.get("scope_begins_unpaired", 0),
+                counts.get("scope_pairs_no_spec", 0), counts.get("scope_pairs_unframed", 0),
+                counts.get("scope_ends_unpaired", 0), counts.get("scope_begins_unpaired", 0),
+            )
+        )
+    if model.get("gpu_frames"):
+        lines.append(
+            "gpu       : %d rendered frame(s) decoded from the GpuProfiler channel (%d pass "
+            "record(s), %d batch(es) that did not read cleanly)" % (
+                counts.get("gpu_frames", 0), counts.get("gpu_events", 0),
+                counts.get("gpu_unreadable", 0),
             )
         )
     if serial_carried and missing:
@@ -1314,6 +1409,7 @@ __all__ = [
     "cmd_threads",
     "cmd_timers",
     "cmd_frames",
+    "cmd_bottleneck",
     "cmd_summary",
     "cmd_verify",
     "cmd_parse",

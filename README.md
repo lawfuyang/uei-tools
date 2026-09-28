@@ -43,9 +43,14 @@ each, and the measured numbers of the corpus — is documented in `REFERENCE.md`
 | key | size | SHA-256 |
 |---|---|---|
 | `editor-pie-1` | 35,495,101 bytes (33.9 MB) | `50E7FF09857B36292336D42AA93DB2219BBBF68DF5F94E705A121B5EEF69F954` |
+| `game-pc-2` | 13,018,825 bytes (12.4 MB) | `C431814A9821D4B188266C4A887A03E662C53130A1AD542A341717E6D3168B1B` |
+| `viewer-pc-3` | 465,564 bytes (0.44 MB) | `51615FD1142D63800F622DD4BAA8723F57A87AF098F2C45FE961776F702F1CDE` |
 
 An editor Play-In-Editor session on PC, protocol 7 (the current format), 51 event types in its
-schema. The corpus rules are inherited from rdc-tools wholesale:
+schema; a game session (`game-pc-2`, 35 types, no GPU channel) and a small viewer session
+(`viewer-pc-3`, 25 types, no frame pairs at all) — three different shapes of capture, and
+`goldens --check` runs the pinned commands over all of them (REFERENCE §8 has what each carries).
+The corpus rules are inherited from rdc-tools wholesale:
 
 * A capture is a **key + SHA-256**, never a committed path. Where this machine keeps the file is
   gitignored local state (`captures.local.json`, once the harness exists). No doc, comment or
@@ -100,7 +105,7 @@ CSV Profiler-format `.csv` first — the channel carries the stat definitions
 (`RegisterCategory`, `DefineDeclaredStat`, `DefineInlineStat`) and, when a CSV capture was
 running, the per-frame values too (`BeginStat`/`EndStat`/`CustomStat`/`Event`/`Metadata`, see
 `REFERENCE.md`). The corpus capture has the definitions but no per-frame CSV events — a capture
-with a CSV capture running is wanted (the `from-trace` bridge above, and ROADMAP §12).
+with a CSV capture running is wanted (the `from-trace` bridge above, and ROADMAP §11).
 
 ## 3. What the engine already answers (and this tool does not rebuild)
 
@@ -141,7 +146,8 @@ three). Commands that need engine-provided tooling will take `--engine-dir` (or 
 | `threads <capture>` | every thread: name and group as the capture itself names them, packets, bytes, events, batches, batch records, first/last cycle (on a cache miss it builds the model, so `--jobs` applies) |
 | `timers <capture> [--filter TEXT] [--limit N]` | the CPU profiler's timer specs: id, name, file:line |
 | `frames <capture> [--limit N]` | `Misc.BeginFrame`/`EndFrame` pairs per thread and frame type, in cycles and seconds since the trace started |
-| `summary <capture> [--budget FPS \| --budget-ms MS] [--tid N] [--limit N]` | is this capture fast? The frame-time **distribution** (mean/min/p50/p95/p99/max + a histogram) against an explicit budget (60 FPS by default) with a verdict, a **hitch count**, and the frames that break the budget — worst first, each naming the timers that ran in it. Exit 0 reported / 2 nothing to time (no frame pairs, or no cycle frequency) — being over budget is the report, not a failure |
+| `bottleneck <capture> [--budget FPS \| --budget-ms MS] [--tid N] [--limit N]` | what bounds a frame: the **game thread**, the **render thread**, the **GPU**, or none of them. Every verdict is a measurement against the budget (the thread's own non-wait scope coverage, the sibling thread's coverage inside the same frame, the GPU's busy time when the capture carries the legacy GPU channel), with the evidence that decided it and the reasons it cannot decide. A capture with no GPU channel gets its CPU finding *plus* "the GPU side is unknown here", never a bare CPU-bound claim. Exit 0 classified / 2 nothing to judge (no frame pairs, no cycle frequency, no scopes) |
+| `summary <capture> [--budget FPS \| --budget-ms MS] [--tid N] [--limit N]` | is this capture fast? The frame-time **distribution** (mean/min/p50/p95/p99/max + a histogram) against an explicit budget (60 FPS by default) with a verdict, a **hitch count**, the one-line bottleneck verdict above, and the frames that break the budget — worst first, each naming the timers that ran in it. Exit 0 reported / 2 nothing to time (no frame pairs, or no cycle frequency) — being over budget is the report, not a failure |
 | `verify <capture> [--jobs N]` | walks everything and reports what does not add up: packet and stream anomalies, schema redefinitions, serial gaps, unpaired frames, unknown bookmark points. **Exit 1** when anything error-level was found |
 | `parse <capture> [--jobs N]` | builds (and caches) the session model; prints what it holds |
 | `cache <capture> [--clear]` | the parse cache beside a capture: status, or remove it |
@@ -152,17 +158,16 @@ three). Commands that need engine-provided tooling will take `--engine-dir` (or 
 
 The parse cache sits beside the capture, keyed by its SHA-256 and the tool version, and never
 changes an answer — only the seconds a command takes: measured on the corpus, a cold full decode
-is 6.0 s (the LZ4 half, in the C library, is 0.6 s of it, the per-thread walk runs over worker
-processes, and attributing each frame's work costs ~0.9 s of the 6.0) and a cached command 0.51 s.
-`--jobs N` sets how many processes that walk may use — any command that has to build the model —
-and `--jobs 0` (the default) chooses for the machine. It cannot change a byte of the output; the
-suite pins serial ≡ parallel.
+is 6.98 s (the LZ4 half, in the C library, is 0.6 s of it, the per-thread walk runs over worker
+processes, and attributing each frame's work and occupancy costs ~1.1 s of it) and a cached command
+0.52 s. `--jobs N` sets how many processes that walk may use — any command that has to build the
+model — and `--jobs 0` (the default) chooses for the machine. It cannot change a byte of the
+output; the suite pins serial ≡ parallel.
 
-Planned (see `ROADMAP.md`): bottleneck classification (CPU/GPU/display), the timer **call tree**
-and self time, thread occupancy, the critical path / task graph, source mapping, a `coverage`
-command that says whether a capture can answer a question at all, GPU / memory / loading /
-stats-channel analyses, the recommendations engine, and `compare` as a CI gate with p99
-thresholds and rolling baselines.
+Planned (see `ROADMAP.md`): the timer **call tree** and self time, thread occupancy findings,
+the critical path / task graph, source mapping, a `coverage` command that says whether a capture
+can answer a question at all, GPU / memory / loading / stats-channel analyses, the
+recommendations engine, and `compare` as a CI gate with p99 thresholds and rolling baselines.
 
 Output philosophy for those: every report carries a `meta` block (tool version, input hashes,
 engine and protocol version detected, engine-dir path as configured, analysis duration,

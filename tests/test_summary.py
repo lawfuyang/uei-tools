@@ -8,7 +8,7 @@ a fixture capture whose four frames are 20, 60, 8 and 32 ms wide with known scop
 from __future__ import annotations
 
 import unittest
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List, Optional, cast
 
 from testcase import UeiaTestCase
 
@@ -35,8 +35,10 @@ def _model(data: bytes) -> Dict[str, Any]:
     return cast(Dict[str, Any], dict(built))
 
 
-def _frame(index: int, tid: int, begin: int, end: int, frame_type: int = 0) -> FrameRow:
-    return FrameRow(index=index, type=frame_type, tid=tid, begin_cycle=begin, end_cycle=end)
+def _frame(index: int, tid: int, begin: int, end: int, frame_type: int = 0,
+           covered: Optional[int] = None, wait: Optional[int] = None) -> FrameRow:
+    return FrameRow(index=index, type=frame_type, tid=tid, begin_cycle=begin, end_cycle=end,
+                    covered_cycles=covered, wait_cycles=wait)
 
 
 def _no_frames_trace() -> bytes:
@@ -352,7 +354,7 @@ class TestTheCommand(UeiaTestCase):
         self.assertRegex(out, r"0\.000\s+-\s+8\.333 ms\s+:\s+1\s+#")
         self.assertRegex(out, r"16\.667\s+-\s+33\.333 ms\s+:\s+2\s+#")
         self.assertRegex(out, r"33\.333 ms and over\s+:\s+1\s+#")
-        self.assertIn("work      : 3 scope pair(s) attributed", out)
+        self.assertIn("work      : 4 scope pair(s) attributed", out)
 
     def test_the_table_names_the_frames_that_break_the_budget_worst_first(self) -> None:
         code, out, _err = self.run_cli(["summary", self._capture()])

@@ -1,0 +1,34 @@
+{
+  "capture": {
+    "key": "viewer-pc-3",
+    "sha256": "51615FD1142D63800F622DD4BAA8723F57A87AF098F2C45FE961776F702F1CDE",
+    "size": 465564
+  },
+  "facts": {
+    "events_stream_packets": 8,
+    "importants_stream_packets": 86,
+    "magic": "2CRT",
+    "packet_anomalies": 0,
+    "packets": 1165,
+    "packets_lz4": 392,
+    "packets_raw": 770,
+    "packets_sync": 3,
+    "payload_bytes": 670087,
+    "protocol": 7,
+    "schema_records": 25,
+    "schema_redefinitions": 0,
+    "schema_types": 25,
+    "size": 465564,
+    "stream_anomalies": 0,
+    "threads_with_packets": 89,
+    "tids": 92,
+    "top_tid_packets": {
+      "1": 86,
+      "2": 42,
+      "6": 29,
+      "7": 27,
+      "74": 36
+    },
+    "transport": 4
+  }
+}

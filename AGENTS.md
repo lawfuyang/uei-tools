@@ -40,11 +40,13 @@ error and warning counts), not "passes".
 `src/py/`, one module per layer, each importing only *down* the layering, and **unprefixed**:
 the entry point is `ueia.py`, so a module's name is its job, not its owner.
 
-`shapes` (shapes, constants, errors) → `lz4` and `timing` (leaves; `lz4` is the ctypes loader,
-not a decoder of our own) → `container` (header + packet walk) → `streams` (per-thread streams)
+`shapes` (shapes, constants, errors) → `lz4`, `timing` and `gpu` (leaves; `lz4` is the ctypes
+loader rather than a decoder of our own, `gpu` decodes the legacy `GpuProfiler` channel's
+per-frame batches) → `container` (header + packet walk) → `streams` (per-thread streams)
 → `events` (framing: records, events, aux, scopes) → `schema` (the vocabulary) → `decode`
-(values + the batch format) → `model` (the session model, incl. the per-frame work attribution)
-→ `summary` (the budget, percentiles and histograms a frame-time report is defined by) → `cache`
+(values + the batch format) → `model` (the session model, incl. the per-frame work attribution
+and occupancy) → `summary` (the budget, percentiles and histograms a frame-time report is
+defined by) → `bottleneck` (the classification on top of them: what bounds a frame) → `cache`
 (the parse cache) → `goldens` (the corpus harness) → `commands` (the commands and their
 rendering) → `ueia.py` (the CLI, which re-exports them all for scripts and tests).
 
@@ -112,7 +114,7 @@ without `gpu` cannot answer a GPU question, one without `memtag`/`memalloc` cann
 question, and one without `task` cannot show a critical path. An analysis whose channel is missing
 reports **skipped** with the re-record line, never zero, never a default and never a guess — the
 same rule as the corpus half's exit 2, one level down. Every analysis that lands says in its tests
-what it does with its channel absent, and `coverage` (ROADMAP §8) is the one command that has to
+what it does with its channel absent, and `coverage` (ROADMAP §7) is the one command that has to
 get this right for all of them at once.
 
 ## Parallel work (the one place processes are used)
@@ -190,9 +192,18 @@ suite's real numbers — test count, pass/fail, pyright errors — not "passes".
 * **The cache stays invisible** — it may change speed, never output; keep tests hermetic
   (scratch dirs via env vars, like rdc-tools' `TempDirCase`). Add cache and corpus state to
   `.gitignore` as it appears. Anything a report needs must therefore be *in the model*: the
-  per-frame work attribution is written by the walk and cached, which is why a warm `summary`
-  costs 0.51 s like any other command (REFERENCE §6, §10) — a second walk at report time would
-  have been the slow path on every run.
+  per-frame work attribution and occupancy are written by the walk and cached, which is why a warm
+  `summary`/`bottleneck` costs 0.52 s like any other command (REFERENCE §6, §10) — a second walk at
+  report time would have been the slow path on every run. Changing what the model *means* means
+  bumping `TOOL_VERSION` in the same change, or a cache built by the old meaning keeps answering with
+  it (this happened during §11's development: the old walk's `wait_cycles` looked like a real
+  finding for one command run).
+* **A scope pair belongs to the frame its *cycle* falls in, never to "the frame that was open".**
+  Frame markers and scope batches do **not** interleave in a `.utrace` — `game-pc-2` writes all
+  771 of a thread's frames in the first 8% of its stream, the batches after them — so stream order
+  answers a question nobody asked. The walk pairs the frames first and then attributes by window
+  (`_pair_windows` + the cycle search), the way the engine's own analyser clips an event to a frame
+  interval; the corpus is what caught this, and it is why the extra pass is not optional.
 * **A sample says it is a sample.** The model keeps frame work only for the longest frames of each
   thread (`_FRAME_WORK_KEEP`), because a capture with 100,000 frames must not carry 100,000 of
   them to name its worst twenty. A report that lists a frame without one prints `-` and says so;

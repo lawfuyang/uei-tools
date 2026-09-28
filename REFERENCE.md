@@ -120,7 +120,7 @@ CsvTools pipeline (README §2):
   Value)`.
 
 Corpus state: the definitions are present, the per-frame events are not — `editor-pie-1` ran
-with the CSV profiler *registered* but no CSV capture active (README §2; ROADMAP §12 wants a
+with the CSV profiler *registered* but no CSV capture active (README §2; ROADMAP §11 wants a
 capture that has both). The engine's own reader of these events is
 `TraceServices\Private\Analyzers\CsvProfilerTraceAnalysis.cpp`, feeding the
 `CsvProfilerProvider` model.
@@ -162,24 +162,24 @@ specs, 27,760 timer specs (4,879 with file:line), 182 counter specs, session dur
 reproduce (`goldens/labels/editor-pie-1.json` pins them).
 
 Cost, measured in this working tree on this machine (2026-09-28, a cold `parse`, frame work
-attribution included — §10):
+attribution, occupancy and the GPU frame decode included — §10, §11):
 
 | phase | serial | `--jobs 0` (the pool) |
 |---|---|---|
-| read the 34 MB file | 0.008 | 0.008 |
+| read the 34 MB file | 0.008 | 0.007 |
 | container header | 0.000 | 0.000 |
-| packets (163,600 headers) | 0.259 | 0.252 |
-| streams (LZ4: 24,767 blocks, 34.8 MB → 49.9 MB) | 0.617 | 0.616 |
-| model (the per-thread Python walk, attribution included) | 11.447 | 5.095 |
-| **cold full decode** | **12.33** | **5.97** |
+| packets (163,600 headers) | 0.259 | 0.247 |
+| streams (LZ4: 24,767 blocks, 34.8 MB → 49.9 MB) | 0.617 | 0.609 |
+| model (the per-thread Python walk, all of the above) | 13.257 | 5.804 |
+| **cold full decode** | **14.07** | **6.98** |
 
-A cached command is **0.51 s** (`summary` included: the work it reports is in the cache, not
-re-derived) and `goldens --check` ~15 s (its transcripts are the pinned commands' real output, so
-it runs a full `verify`).
+A cached command is **0.52 s** (`summary` and `bottleneck` included: everything they report is in
+the cache, never re-derived from the streams) and `goldens --check` ~20 s over the three registered
+captures, whose transcripts are the pinned commands' real output.
 
-Two histories are in that table. The LZ4 half is the C library (§2): with the pure-Python decoder
-the same cold decode was **21.3 s**. And the walk is per-thread work, so `--jobs` spreads it over
-processes — measured **11.45 / 5.10 s** at 1 and 0 workers, and **9.56 / 5.41 / 4.14 / 4.16 /
+Three histories are in that table. The LZ4 half is the C library (§2): with the pure-Python decoder
+the same cold decode was **21.3 s**. The walk is per-thread work, so `--jobs` spreads it over
+processes — measured **13.26 / 5.80 s** at 1 and 0 workers, and **9.56 / 5.41 / 4.14 / 4.16 /
 4.15 s** before the attribution landed. It stops at the *biggest* thread rather than at the core
 count: tid 2 owns 53.4% of the corpus's 10,055,971 batch records, so the ceiling is that one
 thread, and `--jobs 0` (the default) caps its own choice at 8 workers — past that nothing improves
@@ -187,13 +187,16 @@ here, while a capture whose work is spread evenly gets more of the box. The answ
 on `--jobs` at all: shares are merged by one function in ascending tid order, byte-for-byte into
 the cache's own format.
 
-**What the attribution costs** (§10): walking tid 2 alone — 5.49 M of those records, the biggest
-single unit — takes **3.87 s without it and 4.61 s with it (+19%)**, which is the +0.9 s the pool
-shows on the cold total. Two cheaper shapes were measured and rejected on the way: accumulating
-into a dict per frame (**+23%**) and writing every count into the walk's `counts` dict as it goes
-(the loop now keeps its totals and counters in locals and flushes them at the frame boundary and
-the end of the walk). The cost is paid once per capture, by the parse that fills the cache, and a
-warm `summary` is the same 0.51 s as any other cached command.
+**What the attribution and occupancy cost.** Walking tid 2 alone — 5.49 M of those records, the
+biggest single unit — takes **4.09 s with nothing attributed and 5.18 s with the frame work and the
+occupancy (+27%)**, which is the ~1.1 s the pool shows on the critical thread; the cold total went
+5.97 s (work only, before the occupancy) → 6.98 s with everything. Two cheaper shapes were measured
+and rejected on the way: accumulating into a dict per frame (**+23%** against +19% for the locals)
+and writing every count into the walk's `counts` dict as it goes; the loop keeps its totals, its
+running coverage and its counters in locals and flushes them once per frame window. The cost is paid
+once per capture, by the parse that fills the cache; a warm `summary`/`bottleneck` is the same 0.52 s
+as any other cached command, which is the whole reason the occupancy lives in the model rather than
+being recomputed by the report.
 
 ## 7. Where the format is defined (engine source tree)
 
@@ -224,7 +227,7 @@ A capture carries only what it was recorded with (`-trace=<id>,<id>...`; the mac
 channel are `UE_TRACE_CHANNEL*` in `Runtime\TraceLog\Public\Trace\Trace.h`). This is the inventory
 of what the engine can emit — gathered from the tree on 2026-09-28, grouped by the question it
 answers, with the engine analyser to mirror for field-level truth. **An absent channel is not a
-zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §8).
+zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §7).
 
 | Channel | Carries | Answers | Engine analyser to mirror |
 |---|---|---|---|
@@ -257,9 +260,19 @@ zero value: it is a question the capture cannot answer**, and the tool says so (
 Capture presets the engine ships (`TraceAuxiliary.cpp`): `-trace=Default` is
 `cpu,gpu,frame,log,bookmark,screenshot,region`, and `-trace=Memory` is
 `memtag,memalloc,callstack,module` (read-only). `-trace=Memory_Light` is `memtag,memalloc`.
-The corpus (`editor-pie-1`) carries `cpu` (scopes), `frame`, `log`, `bookmark`, `counters`,
-`region`-free but scope-rich — and **no** `gpu`, `task`, `memtag`, `memalloc`, `loadtime` or
-`screenshot`, which is exactly why several roadmap items want a second capture.
+
+What the registered captures actually carry — checked against their own schemas on 2026-09-28, which
+corrected this file:
+
+| Capture | Carries | Does **not** carry |
+|---|---|---|
+| `editor-pie-1` (editor PIE) | `cpu` scopes, `frame`, `log`, `bookmark`, `counters`, `region`, the **legacy** `GpuProfiler` channel (§11: 1,410 rendered frames, 37 named passes) and `Memory.MemoryScope` (42,029 events, a `Tag i32` scope) | `task`, `memalloc`/`callstack`/`module`, `loadtime`, `screenshot` |
+| `game-pc-2` (game) | the same CPU channels, `Memory.MemoryScope` (38,595), CSV/stat *definitions* | everything GPU (no `GpuProfiler` at all), `task`, allocations, `loadtime` |
+| `viewer-pc-3` | `cpu` scopes, counters, log | **any frame pair**, GPU, `task` |
+
+So the GPU and memory items do not start from nothing after all; what is still missing for a full
+GPU answer is the *current* channel's queue semantics (waits, fences, breadcrumbs — §11 decodes the
+legacy per-frame form), and for memory an allocations channel rather than a tag scope.
 
 ## 9. Engine programs that read traces (what we wrap, and what we do not)
 
@@ -305,17 +318,17 @@ it and the timers that own them. Every word in that sentence is defined here.
   most 16, the last one open-ended), because a linear axis would put every frame of a
   hitch-ridden capture in its first bin.
 * **What ran in a frame** comes from the batch records (§3): the walk pairs each begin with its
-  end — the wire carries a spec id only on the begin — and attributes the pair's **inclusive**
-  cycles (a scope that contains another counts its children too) to the frame that was open when
-  the pair *ended*. The report's percentage is of the frame's own span, so inclusive shares can add
-  up past 100%; that is the point: the timer that owns the frame reads as one number.
-* **What could not be attributed is counted, never guessed.** Five model counters carry it, and
+  end — the wire carries a spec id only on the begin — and attributes the pair's cycles to the frame
+  whose span holds the pair's **end cycle**, clipped to that frame (§11 has why it is the cycle and
+  not the stream order). The item's cycles are that clipped **inclusive** time (a scope that
+  contains another counts its children too, clipped to the same window), so the report's percentages
+  can add up past 100% — which is the point: the timer that owns the frame reads as one number.
+* **What could not be attributed is counted, never guessed.** Six model counters carry it, and
   `verify` prints them whenever a capture has frames:
-  `scope_pairs` (attributed), `scope_pairs_spanning` (began before the frame that ended them),
-  `scope_pairs_no_spec` (a V3 coroutine record, which has no spec id on the wire, or an id the
-  capture never declared), `scope_ends_unpaired`, `scope_begins_unpaired`. Pairs that lie outside
-  every frame — before the first `BeginFrame`, after the last `EndFrame` — are not counted at all:
-  the frame is what is being attributed to.
+  `scope_pairs` (attributed, a declared spec), `scope_pairs_spanning` (clipped at the frame's
+  begin), `scope_pairs_no_spec` (a V3 coroutine record, which has no spec id on the wire, or an id
+  the capture never declared), `scope_pairs_outside` (ended in no frame window at all),
+  `scope_ends_unpaired`, `scope_begins_unpaired`.
 * **The work kept is a sample by construction**: the **16 longest frames of each thread**, up to 6
   timers each (`model._FRAME_WORK_KEEP`, `_FRAME_WORK_TOP`), live in the model — so `summary` on a
   warm cache costs what any other cached command costs (0.51 s, §6) and never re-walks the file. A
@@ -327,3 +340,79 @@ it and the timers that own them. Every word in that sentence is defined here.
   frame track draws, and a timer is a `CpuProfiler` batch scope named by the capture's own spec
   table, which is what that export enumerates. When an engine build exists on the machine, that
   export is the comparison to run (README §3).
+
+## 11. The bottleneck verdict, and the GPU channel it is measured against
+
+`ueia bottleneck` answers the practice's first question — game thread, render thread, GPU, or none
+of them — and `summary` prints its one-line verdict. Three things it needs, and what each is here:
+
+**1. A frame's own occupancy.** Cycles of a frame's window that the frame's thread spent inside a
+scope, **merged** (overlapping scopes count once) and split into work and wait. The split is what
+makes the measure usable: on the corpus the render thread is inside a scope for 97% of its frames
+and inside `WaitForTasks`/`WaitUntilTasksComplete` for 99.7% of *that*, so without it every render
+frame would read as "render-thread bound". A scope counts as a wait when its name says so
+(`model.WAIT_NAME_MARKERS`, the engine's own `WaitFor*` naming) — **heuristic**, and labelled as such
+wherever it is used.
+
+Crucially, a scope pair belongs to a frame by **cycle**, not by stream order: the frame markers and
+the scope batches do not interleave in a `.utrace` (the game capture (`game-pc-2`) flushes all 771 game
+frames in the first 8% of the thread's stream, the batches after them; on `editor-pie-1` whole
+ranges carry one and not the other), so "the frame that was open when the pair was read" is no frame
+at all. The walk therefore pairs the frames first (`_pair_windows`, a header-only pass) and then
+attributes every pair to the window whose span holds the pair's **end** cycle, clipped to it — the
+same thing the engine's own `FrameStatsHelper` does when it clips an event to a frame interval. The
+counters say what that cost: `scope_pairs` (attributions with a declared spec),
+`scope_pairs_spanning` (clipped at the frame's begin — 2,838 on the corpus), `scope_pairs_no_spec`,
+`scope_pairs_unframed` (ended in no window at all — which on the corpus is 2.2 M pairs, almost all of
+them on threads that have no frames: 104 thread ids carry packets, 2 carry frames),
+`scope_ends_unpaired`, `scope_begins_unpaired`.
+
+Measured on the corpus: the game thread is inside scopes for 8% of a frame (p50) and the render
+thread 97% (89% of that in waits) — against the game capture's game thread at 99% (its
+`FlushRenderingCommands`/`GameThreadWaitForTask` frames are the ones that read as waits).
+
+**2. The other frame series of the capture.** A game frame and the render frame beside it are one
+frame of the pipeline, so each judged frame is matched to the frames of other threads that **overlap
+it** in cycles, and the busiest of them is the one a verdict names. Thread roles (`game`, `render`,
+`rhi`) come from the capture's own thread names (`GameThread`, `RenderThread 0`, `RHIThread`) —
+**heuristic** again, and each report line says so.
+
+**3. The GPU.** The corpus carries the **legacy** `GpuProfiler` channel (one event per rendered
+frame), not the current one (one event per GPU work item): the writer was removed in UE 5.6, and UE
+5.8.3 ships only the reader (`OldGpuProfilerTraceAnalysis.cpp`, "maintained for backward
+compatibility with old traces"). That reader is the layout's authority, and `gpu.py` follows it field
+for field:
+
+| Event | Fields | Meaning |
+|---|---|---|
+| `GpuProfiler.EventSpec` | `uint32 EventType`, `WideString[] Name` | the id → name map (37 specs on the corpus: `SlateUI`, `Basepass`, `Prepass`, `TAA`, `NaniteEditor`, …) |
+| `GpuProfiler.Frame` | `uint64 CalibrationBias`, `uint64 TimestampBase`, `uint32 RenderingFrameNumber`, `uint8[] Data` | one rendered frame |
+
+`Data` is a varint-delta stream (`Utils.h`'s `Decode7bit`), not a struct array: `packed =
+Decode7bit(); timestamp += packed >> 1; if (packed & 1)` a begin follows, whose spec id is the next
+4 bytes little-endian, else an end. `busy_us` is the sum of the **outermost** spans — outermost
+spans cannot overlap, so that is the union: the microseconds the GPU spent executing traced work.
+It is a *duration*, so `CalibrationBias` cancels and is never interpreted; `TimestampBase` is kept
+for the alignment.
+
+**The alignment is measured, not assumed.** The GPU clock is not the CPU clock: on the corpus the GPU
+timeline spans 215.175 s where the render thread's frames span 217.171 s, so the scale between them
+is fitted (1.0094) and each GPU frame is placed inside the window its scaled time falls in — 1,409 of
+1,410 land inside one. Fewer than half, or a scale outside 1 ± 0.25: the alignment is **refused**, and
+the report says the GPU side is unknown, because an unplaced GPU number is not evidence about a frame.
+
+**The decision tree is the engine's** (`Engine/Private/ChartCreation.cpp:1325-1349`, "if frame time is
+greater than our target then we are bounded by something", and `DynamicResolution.cpp:280-290`): over
+budget and the frame's thread worked ≥ budget → **game**-bound; else a partner thread did → **render**;
+else the GPU was busy ≥ budget → **GPU**-bound; else **unexplained** (and when most unexplained frames
+sit within 5% of a multiple of 1/60, 1/30, 1/120 or 1/90 s, a **frame-rate/display cap** note, marked
+heuristic). A capture with no GPU channel never gets a bare "CPU-bound": the finding comes with "the
+GPU side is unknown here" and the re-record line.
+
+What the corpus says, with those rules (pinned as transcripts):
+
+| capture | verdict |
+|---|---|
+| `editor-pie-1` | 61 of 1413 frames game-thread bound; 1320 unexplained, **1094 of them pinned to a display period** (an editor throttled to ~3 FPS: p50 frame 33.4 ms, GPU p50 0.25 ms); the 121.5 s PIE frame is game-bound (118,999.8 ms of `UEditorEngine::StartPlayInEditorSession` inclusive inside it) |
+| `game-pc-2` | 9 of 771 frames bound (1 game, 8 render); 761 unexplained with **no GPU channel to check against** — its game thread is inside wait-shaped scopes (`FlushRenderingCommands`, `GameThreadWaitForTask`) for its whole 905 ms frames, so "waiting on something this capture cannot show" is the honest answer |
+| `viewer-pc-3` | no `Misc.BeginFrame` pairs at all: exit 2, never zero |

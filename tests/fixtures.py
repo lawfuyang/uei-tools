@@ -308,6 +308,8 @@ def work_stream() -> bytes:
     first = (
         varint((1002000 << 2) | 1) + varint(8)      # FrameTime begins at 1,002,000
         + varint((8000 << 2) | 0)                   # ends 8,000 cycles later
+        + varint((2000 << 2) | 1) + varint(9)       # WaitForTasks begins at 1,012,000
+        + varint((6000 << 2) | 0)                   # ends 6,000 cycles later -- the wait split
     )
     second = (
         varint((1025000 << 2) | 1) + varint(7)      # Tick begins at 1,025,000
@@ -342,6 +344,9 @@ def work_importants() -> bytes:
         + important_record(20, pack("u32", 8) + pack("u32", 92)
                            + important_aux_block(1, b"FrameTime")
                            + important_aux_block(2, b"Game.cpp"))
+        + important_record(20, pack("u32", 9) + pack("u32", 42)
+                           + important_aux_block(1, b"WaitForTasks")
+                           + important_aux_block(2, b"TaskGraph.cpp"))
     )
 
 
@@ -350,11 +355,12 @@ def work_trace() -> bytes:
 
     Every number is round on purpose (the frequency is 1,000,000, so 1 cycle is 1 microsecond, and
     the frames start at cycle 1,000,000, so a frame's `at` is its own offset): the frame spans are
-    20, 60, 8 and 32 ms, the scope inside the first is 8 ms, and the second holds a nested pair --
-    45 ms of `Tick` containing 20 ms of `FrameTime`. What that implies for a 60 FPS budget (three
-    frames over it, one hitch, p50 20 ms, three histogram bins filled) is pinned by hand in
-    `test_summary`; the third and fourth frames carry no work at all, so a report has to say so
-    rather than leave a hole.
+    20, 60, 8 and 32 ms, the first holds 8 ms of `FrameTime` and then 6 ms of `WaitForTasks` (so its
+    occupancy is 14 ms, 6 of them waiting), and the second holds a nested pair -- 45 ms of `Tick`
+    containing 20 ms of `FrameTime`. What that implies for a 60 FPS budget (three frames over it,
+    one hitch, p50 20 ms, three histogram bins filled) is pinned by hand in `test_summary`; the
+    third and fourth frames carry no work at all, so a report has to say so rather than leave a
+    hole.
     """
     return build_trace(
         events_stream=work_schema(), importants_stream=work_importants(),

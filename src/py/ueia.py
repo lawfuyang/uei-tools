@@ -16,6 +16,11 @@ Commands:
   timers <capture>            the CPU profiler's timer specs, with file:line
                               (--filter TEXT, --limit N)
   frames <capture>            BeginFrame/EndFrame pairs, in cycles (--limit N)
+  bottleneck <capture>        what bounds a frame: the game thread, the render thread,
+                              the GPU, or none of them -- every verdict measured against
+                              the budget, with the evidence and the reasons it cannot
+                              decide (--budget, --budget-ms, --tid, --limit; exit 2 when
+                              the capture has no frames, no cycle frequency or no scopes)
   summary <capture>           the frame-time distribution against a budget, and the
                               frames that break it with the timers that ran in them
                               (--budget FPS | --budget-ms MS, default 60 FPS; --tid N
@@ -88,6 +93,7 @@ from shapes import *  # noqa: F401,F403
 from streams import *  # noqa: F401,F403
 from timing import *  # noqa: F401,F403
 from commands import (
+    cmd_bottleneck,
     cmd_cache,
     cmd_csv,
     cmd_frames,
@@ -113,6 +119,7 @@ _CAPTURE_COMMANDS = {
     "threads": cmd_threads,
     "timers": cmd_timers,
     "frames": cmd_frames,
+    "bottleneck": cmd_bottleneck,
     "summary": cmd_summary,
     "verify": cmd_verify,
     "parse": cmd_parse,

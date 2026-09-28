@@ -3,5 +3,15 @@
     "notes": "editor PIE session on PC, protocol 7; the initial corpus capture",
     "sha256": "50E7FF09857B36292336D42AA93DB2219BBBF68DF5F94E705A121B5EEF69F954",
     "size": 35495101
+  },
+  "game-pc-2": {
+    "notes": "a game session on PC, protocol 7: the game-side capture, with CPU channels and memory-tag scopes but no GpuProfiler channel and no TaskGraph events",
+    "sha256": "C431814A9821D4B188266C4A887A03E662C53130A1AD542A341717E6D3168B1B",
+    "size": 13018825
+  },
+  "viewer-pc-3": {
+    "notes": "a viewer-mode session on PC, protocol 7; the small capture, and the one with no Misc.BeginFrame/EndFrame pairs at all",
+    "sha256": "51615FD1142D63800F622DD4BAA8723F57A87AF098F2C45FE961776F702F1CDE",
+    "size": 465564
   }
 }

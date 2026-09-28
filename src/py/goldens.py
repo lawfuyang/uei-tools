@@ -40,6 +40,7 @@ PINNED_COMMANDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("info", ()),
     ("verify", ()),
     ("summary", ("--budget", "60")),
+    ("bottleneck", ("--budget", "60")),
     ("threads", ("--format", "csv")),
     ("timers", ("--format", "csv", "--limit", "0")),
     ("frames", ("--format", "csv", "--limit", "0")),
