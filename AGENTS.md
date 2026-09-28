@@ -11,7 +11,7 @@ Any change to `src/py/` or `tests/` is not finished until all three pass:
 
 ```powershell
 python src\py\ueia.py lz4 --build       # step 0: bin/ueia_lz4.dll, built only when stale
-python src\py\ueia.py selftest          # the hermetic suite: ~10 s, exit 0 pass / 1 fail / 2 bad option
+python src\py\ueia.py selftest          # the hermetic suite: ~20 s, exit 0 pass / 1 fail / 2 bad option
 npx --yes pyright@latest                # must print: 0 errors, 0 warnings
 python src\py\ueia.py goldens --check   # the corpus: exit 0 matched / 1 a problem / 2 nothing to compare
 ```
@@ -43,9 +43,10 @@ the entry point is `ueia.py`, so a module's name is its job, not its owner.
 `shapes` (shapes, constants, errors) → `lz4` and `timing` (leaves; `lz4` is the ctypes loader,
 not a decoder of our own) → `container` (header + packet walk) → `streams` (per-thread streams)
 → `events` (framing: records, events, aux, scopes) → `schema` (the vocabulary) → `decode`
-(values + the batch format) → `model` (the session model) → `cache` (the parse cache) →
-`goldens` (the corpus harness) → `commands` (the commands and their rendering) → `ueia.py` (the
-CLI, which re-exports them all for scripts and tests).
+(values + the batch format) → `model` (the session model, incl. the per-frame work attribution)
+→ `summary` (the budget, percentiles and histograms a frame-time report is defined by) → `cache`
+(the parse cache) → `goldens` (the corpus harness) → `commands` (the commands and their
+rendering) → `ueia.py` (the CLI, which re-exports them all for scripts and tests).
 
 Two names are deliberately *not* the obvious ones, and the reasons are measured:
 `types.py` is impossible — the interpreter preloads the stdlib `types`, so `import types` would
@@ -111,7 +112,7 @@ without `gpu` cannot answer a GPU question, one without `memtag`/`memalloc` cann
 question, and one without `task` cannot show a critical path. An analysis whose channel is missing
 reports **skipped** with the re-record line, never zero, never a default and never a guess — the
 same rule as the corpus half's exit 2, one level down. Every analysis that lands says in its tests
-what it does with its channel absent, and `coverage` (ROADMAP §9) is the one command that has to
+what it does with its channel absent, and `coverage` (ROADMAP §8) is the one command that has to
 get this right for all of them at once.
 
 ## Parallel work (the one place processes are used)
@@ -188,7 +189,17 @@ suite's real numbers — test count, pass/fail, pyright errors — not "passes".
   envelope rather than reformatting them.
 * **The cache stays invisible** — it may change speed, never output; keep tests hermetic
   (scratch dirs via env vars, like rdc-tools' `TempDirCase`). Add cache and corpus state to
-  `.gitignore` as it appears.
+  `.gitignore` as it appears. Anything a report needs must therefore be *in the model*: the
+  per-frame work attribution is written by the walk and cached, which is why a warm `summary`
+  costs 0.51 s like any other command (REFERENCE §6, §10) — a second walk at report time would
+  have been the slow path on every run.
+* **A sample says it is a sample.** The model keeps frame work only for the longest frames of each
+  thread (`_FRAME_WORK_KEEP`), because a capture with 100,000 frames must not carry 100,000 of
+  them to name its worst twenty. A report that lists a frame without one prints `-` and says so;
+  it never presents the absence as an empty frame, and never re-derives the answer it dropped.
+  The same rule covers the attribution's leftovers: a scope pair that could not be attributed is
+  *counted* (`scope_pairs_spanning`, `scope_pairs_no_spec`, the unpaired ends and begins), and
+  `verify` prints those counts — a gap in a report is a number, not silence.
 * **One machine, offline.** No network, no device, no live connections — see ROADMAP's not-list
   before proposing work that needs one.
 
@@ -223,9 +234,10 @@ mode, zero errors and zero warnings.
 
 * Docs: `README.md` (setup, corpus, CsvTools reuse, the playbook), `REFERENCE.md` (the capture
   format, decoded: container, packets, event streams, schema incl. the CSV Profiler's events,
-  the engine file map, corpus measurements), `ROADMAP.md` (build order, P-labels, scope, the
-  not-list — landed items are removed, cross-references updated in the same change),
-  `AGENTS.md` (this file).
+  the engine file map, corpus measurements, and §10's definitions of what a frame-time report
+  means by a frame, a percentile, a hitch and "what ran in it"), `ROADMAP.md` (build order,
+  P-labels, scope, the not-list — landed items are removed, cross-references updated in the same
+  change), `AGENTS.md` (this file).
 * Nothing that belongs to one machine's working tree is committed — local state (the parse
   cache, `captures.local.json`, exported reports, generated SVGs, CSV captures) goes into
   `.gitignore` as it appears.

@@ -16,6 +16,11 @@ Commands:
   timers <capture>            the CPU profiler's timer specs, with file:line
                               (--filter TEXT, --limit N)
   frames <capture>            BeginFrame/EndFrame pairs, in cycles (--limit N)
+  summary <capture>           the frame-time distribution against a budget, and the
+                              frames that break it with the timers that ran in them
+                              (--budget FPS | --budget-ms MS, default 60 FPS; --tid N
+                              picks the frame series, --limit N the rows; exit 2 when
+                              the capture has no frames or no cycle frequency)
   verify <capture>            walk everything and report what does not add up
                               (exit 1 when anything error-level was found)
   parse <capture>             build (and cache) the session model; prints what it holds
@@ -53,7 +58,7 @@ Commands:
 Row commands take --format table|csv|markdown (table is the default; in the
 non-table forms stdout is the table alone and the prose moves to stderr) and
 every cap applies in all three. --jobs N says how many worker processes the
-per-thread walk may use (parse and verify are the ones that walk; 0, the
+per-thread walk may use (any command that has to build the model; 0, the
 default, chooses for the machine, 1 stays in this process) and never changes
 the answer. Nothing is timed on stdout: $UEI_PROFILE=1 prints a per-phase
 table on stderr, $UEI_PROGRESS=1 live progress lines, and $UEI_NO_CACHE=1
@@ -92,6 +97,7 @@ from commands import (
     cmd_parse,
     cmd_schema,
     cmd_selftest,
+    cmd_summary,
     cmd_threads,
     cmd_timers,
     cmd_verify,
@@ -107,6 +113,7 @@ _CAPTURE_COMMANDS = {
     "threads": cmd_threads,
     "timers": cmd_timers,
     "frames": cmd_frames,
+    "summary": cmd_summary,
     "verify": cmd_verify,
     "parse": cmd_parse,
     "cache": cmd_cache,

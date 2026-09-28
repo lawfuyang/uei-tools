@@ -283,6 +283,85 @@ def demo_trace() -> bytes:
     return build_trace(events_stream=schema, importants_stream=importants, threads={2: stream})
 
 
+def work_schema() -> bytes:
+    """The vocabulary `work_stream` needs: two timer specs and the frame pair events."""
+    return (
+        new_event_record(16, "$Trace", "NewTrace",
+                         [("StartCycle", "u64"), ("CycleFrequency", "u64")],
+                         flags=EVENT_FLAG_NOSYNC)
+        + new_event_record(17, "$Trace", "ThreadInfo", [("ThreadId", "u32"), ("Name", "s")],
+                           flags=EVENT_FLAG_IMPORTANT | EVENT_FLAG_MAYBE_HAS_AUX
+                           | EVENT_FLAG_NOSYNC)
+        + new_event_record(20, "CpuProfiler", "EventSpec",
+                           [("Id", "u32"), ("Name", "s"), ("File", "s"), ("Line", "u32")],
+                           flags=EVENT_FLAG_IMPORTANT | EVENT_FLAG_MAYBE_HAS_AUX
+                           | EVENT_FLAG_NOSYNC)
+        + new_event_record(21, "CpuProfiler", "EventBatchV2", [("Data", "arr")],
+                           flags=EVENT_FLAG_NOSYNC | EVENT_FLAG_MAYBE_HAS_AUX)
+        + new_event_record(22, "Misc", "BeginFrame", [("Cycle", "u64"), ("FrameType", "u8")])
+        + new_event_record(23, "Misc", "EndFrame", [("Cycle", "u64"), ("FrameType", "u8")])
+    )
+
+
+def work_stream() -> bytes:
+    """One thread's frames and the timer scopes inside them, as `work_trace`'s capture has them."""
+    first = (
+        varint((1002000 << 2) | 1) + varint(8)      # FrameTime begins at 1,002,000
+        + varint((8000 << 2) | 0)                   # ends 8,000 cycles later
+    )
+    second = (
+        varint((1025000 << 2) | 1) + varint(7)      # Tick begins at 1,025,000
+        + varint((5000 << 2) | 1) + varint(8)       # FrameTime inside it, at 1,030,000
+        + varint((20000 << 2) | 0)                  # FrameTime ends at 1,050,000
+        + varint((20000 << 2) | 0)                  # Tick ends at 1,070,000
+    )
+    return (
+        # the frame events are sync events (the capture declares them without NoSync), so each
+        # carries a serial: the walker reads three bytes for it before the payload
+        event(22, pack("u64", 1000000) + pack("u8", 0), serial=1)
+        + event(21, b"", aux=[(0, first)], maybe_aux=True)
+        + event(23, pack("u64", 1020000) + pack("u8", 0), serial=2)
+        + event(22, pack("u64", 1020000) + pack("u8", 0), serial=3)
+        + event(21, b"", aux=[(0, second)], maybe_aux=True)
+        + event(23, pack("u64", 1080000) + pack("u8", 0), serial=4)
+        + event(22, pack("u64", 1080000) + pack("u8", 0), serial=5)
+        + event(23, pack("u64", 1088000) + pack("u8", 0), serial=6)
+        + event(22, pack("u64", 1088000) + pack("u8", 0), serial=7)
+        + event(23, pack("u64", 1120000) + pack("u8", 0), serial=8)
+    )
+
+
+def work_importants() -> bytes:
+    """The specs and thread names `work_stream` refers to."""
+    return (
+        important_record(16, pack("u64", 1000000) + pack("u64", 1000000))
+        + important_record(17, pack("u32", 2) + important_aux_block(1, b"GameThread"))
+        + important_record(20, pack("u32", 7) + pack("u32", 91)
+                           + important_aux_block(1, b"Tick")
+                           + important_aux_block(2, b"Game.cpp"))
+        + important_record(20, pack("u32", 8) + pack("u32", 92)
+                           + important_aux_block(1, b"FrameTime")
+                           + important_aux_block(2, b"Game.cpp"))
+    )
+
+
+def work_trace() -> bytes:
+    """A capture whose frames have timer work in them: four frames, one of them a hitch.
+
+    Every number is round on purpose (the frequency is 1,000,000, so 1 cycle is 1 microsecond, and
+    the frames start at cycle 1,000,000, so a frame's `at` is its own offset): the frame spans are
+    20, 60, 8 and 32 ms, the scope inside the first is 8 ms, and the second holds a nested pair --
+    45 ms of `Tick` containing 20 ms of `FrameTime`. What that implies for a 60 FPS budget (three
+    frames over it, one hitch, p50 20 ms, three histogram bins filled) is pinned by hand in
+    `test_summary`; the third and fourth frames carry no work at all, so a report has to say so
+    rather than leave a hole.
+    """
+    return build_trace(
+        events_stream=work_schema(), importants_stream=work_importants(),
+        threads={2: work_stream()},
+    )
+
+
 def scope(uid: int) -> bytes:
     """A plain EnterScope/LeaveScope marker (one byte, no payload)."""
     return bytes((uid << 1,))

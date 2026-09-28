@@ -32,6 +32,7 @@ from shapes import (
     CsvStatRow,
     EventTypeRow,
     FrameRow,
+    FrameWorkRow,
     RawEvent,
     TID_EVENTS,
     TID_IMPORTANTS,
@@ -42,6 +43,13 @@ from shapes import (
 )
 
 MAX_ANOMALY_SAMPLES = 20
+
+#: How many of a thread's longest frames keep their work attribution (`FrameWorkRow`), and how many
+#: timer specs each of those rows names. Sixteen frames is more than any report lists (the summary's
+#: table caps at ten by default, and what it lists is the worst), and six timers is more than it
+#: prints (three), so the cache holds a little room around what is asked for -- and nothing else.
+_FRAME_WORK_KEEP = 16
+_FRAME_WORK_TOP = 6
 
 _COUNTS_KEYS = (
     "new_events",
@@ -67,6 +75,12 @@ _COUNTS_KEYS = (
     "serial_carried",
     "serial_min",
     "serial_max",
+    # the frame work attribution: matched scope pairs and what could not be matched
+    "scope_pairs",
+    "scope_pairs_spanning",
+    "scope_pairs_no_spec",
+    "scope_ends_unpaired",
+    "scope_begins_unpaired",
 )
 
 
@@ -116,6 +130,7 @@ class SessionModel(TypedDict):
     threads: List[ThreadRow]
     timers: List[TimerRow]
     frames: List[FrameRow]
+    frame_work: List[FrameWorkRow]
     bookmarks: List[BookmarkRow]
     counters: List[CounterSpecRow]
     counter_values: Dict[str, int]
@@ -207,6 +222,7 @@ class ThreadShare(TypedDict):
     region_counts: Dict[str, int]
     anomalies: List[Anomaly]
     frames: List[FrameRow]
+    frame_work: List[FrameWorkRow]
     bookmarks: List[BookmarkRow]
 
 
@@ -220,6 +236,7 @@ class ModelAcc(TypedDict):
     region_counts: Dict[str, int]
     anomalies: List[Anomaly]
     frames: List[FrameRow]
+    frame_work: List[FrameWorkRow]
     bookmarks: List[BookmarkRow]
 
 
@@ -231,11 +248,71 @@ _COUNTS_ADDITIVE = tuple(key for key in _COUNTS_KEYS if key not in ("serial_min"
 _CONTEXT: Dict[str, Any] = {}
 
 
+class _FrameWork(object):
+    """One frame of one thread while it is open: its begin, and what has run inside it.
+
+    A plain object with slots rather than a dict because it sits in the hot loop (the corpus's game
+    thread opens and closes 1,413 of these over 5.5 M batch records). The totals themselves are
+    *not* written here per scope pair -- that would be an attribute lookup and a dict update per
+    pair, measured at +23% on the corpus's game thread; the loop keeps them in locals and hands them
+    back with `_keep_totals` when the frame stops being the current one (measured cost of the whole
+    attribution: +13%, REFERENCE §6).
+    """
+
+    __slots__ = ("type", "begin", "seq", "pairs", "totals", "touched")
+
+    def __init__(self, frame_type: int, begin: int, seq: int) -> None:
+        self.type = frame_type
+        self.begin = begin
+        self.seq = seq
+        self.pairs = 0
+        self.totals: Optional[List[int]] = None
+        self.touched: List[int] = []
+
+    def row(self, tid: int, end: int, top: int) -> FrameWorkRow:
+        """This frame as the model keeps it: the biggest specs by inclusive cycles, then by id."""
+        items: List[Tuple[int, int]] = []
+        if self.totals is not None and self.touched:
+            totals = self.totals
+            ordered = sorted(self.touched, key=lambda spec: (-totals[spec], spec))
+            items = [(spec, totals[spec]) for spec in ordered[:top]]
+        return FrameWorkRow(
+            tid=tid, type=self.type, begin_cycle=self.begin, end_cycle=end,
+            cycles=end - self.begin, pairs=self.pairs, items=items,
+        )
+
+
+def _keep_totals(state: _FrameWork, totals: Optional[List[int]], touched: List[int],
+                 pairs: int) -> None:
+    """Hand the loop's live totals back to the frame they were counted in."""
+    state.totals = totals
+    state.touched = touched
+    state.pairs = pairs
+
+
+def _live_totals(state: Optional[_FrameWork]) -> Tuple[Optional[List[int]], List[int], int]:
+    """The totals a frame had when it stopped being the current one (what the loop carries)."""
+    if state is None:
+        return None, [], 0
+    return state.totals, state.touched, state.pairs
+
+
+def _newest(open_frames: Dict[Tuple[int, int], List[_FrameWork]]) -> Optional[_FrameWork]:
+    """The most recently begun frame still open on this thread -- where a scope's cycles land."""
+    newest: Optional[_FrameWork] = None
+    for pending in open_frames.values():
+        for state in pending:
+            if newest is None or state.seq > newest.seq:
+                newest = state
+    return newest
+
+
 def _walk_tid(
     tid: int,
     stream: bytes,
     registry: schema.SchemaRegistry,
     bookmark_specs: Dict[int, Tuple[str, str, int]],
+    spec_count: int = 0,
 ) -> ThreadShare:
     """Walk one thread's stream: everything about that thread, and nothing about any other.
 
@@ -244,6 +321,14 @@ def _walk_tid(
     `--jobs` possible at all: this function *is* the unit a worker process runs, and what it returns
     is small enough to send back. It keeps the counters it wrote, so `_merge_share` is the only
     place where two threads meet.
+
+    `spec_count` (one past the highest timer spec the capture declared, or 0 when it declared none)
+    turns on the frame work attribution: batch records carry timer begins and ends, so a scope stack
+    pairs them, and each pair's inclusive cycles land on the frame that was open when it ended.
+    Only the thread's longest frames keep their totals (`_FRAME_WORK_KEEP`), and everything that
+    could not be attributed -- a pair that began before the frame, one with no spec id or an
+    undeclared one, an end with no begin -- is counted instead of guessed at. With `spec_count` 0
+    none of this runs, and the walk costs what it always did.
     """
     trow = _empty_thread_row(tid)
     counts = zero_counts()
@@ -251,10 +336,25 @@ def _walk_tid(
     counter_values: Dict[str, int] = {}
     region_counts: Dict[str, int] = {"begins": 0, "ends": 0}
     anomalies: List[Anomaly] = []
-    frame_begins: Dict[Tuple[int, int], List[int]] = {}
+    open_frames: Dict[Tuple[int, int], List[_FrameWork]] = {}
     frame_rows: List[FrameRow] = []
+    frame_work: List[FrameWorkRow] = []
     bookmarks: List[BookmarkRow] = []
     last_cycle = 0
+    attribute = spec_count > 0
+    stack: List[Tuple[Optional[int], int]] = []
+    current: Optional[_FrameWork] = None
+    keeper: List[FrameWorkRow] = []
+    seq = 0
+    # the hot loop's own copies of the current frame's totals and of the counters it writes: an
+    # attribute lookup or a dict update per scope pair is what makes the attribution expensive
+    totals: Optional[List[int]] = None
+    touched: List[int] = []
+    pairs = 0
+    attributed = 0
+    spanning = 0
+    no_spec = 0
+    ends_unpaired = 0
     for event in events.iter_thread_events(stream, tid, registry, anomalies, counts):
         if event.b_scope:
             continue
@@ -297,13 +397,35 @@ def _walk_tid(
             trow["batches"] = int(trow["batches"]) + 1
             trow["batch_records"] = int(trow["batch_records"]) + len(records)
             first_cycle = int(trow["first_cycle"])
-            for delta, _spec_id, _is_begin in records:
+            for delta, spec_id, is_begin in records:
                 cycle = delta
                 if cycle < last_cycle:
                     cycle += last_cycle
                 last_cycle = cycle
                 if first_cycle == 0:
                     first_cycle = cycle
+                if not attribute:
+                    continue
+                if is_begin:
+                    stack.append((spec_id, cycle))
+                elif stack:
+                    spec, begin = stack.pop()
+                    if current is None:
+                        continue
+                    if begin < current.begin:
+                        spanning += 1
+                    elif spec is None or spec >= spec_count:
+                        no_spec += 1
+                    else:
+                        if totals is None:
+                            totals = [0] * spec_count
+                        if totals[spec] == 0:
+                            touched.append(spec)
+                        totals[spec] += cycle - begin
+                        pairs += 1
+                        attributed += 1
+                else:
+                    ends_unpaired += 1
             if last_cycle:
                 trow["first_cycle"] = first_cycle
                 trow["last_cycle"] = last_cycle
@@ -313,15 +435,33 @@ def _walk_tid(
             if cycle is None:
                 continue
             if full_name == "Misc.BeginFrame":
-                frame_begins.setdefault((tid, frame_type), []).append(cycle)
+                seq += 1
+                if current is not None:
+                    _keep_totals(current, totals, touched, pairs)
+                state = _FrameWork(frame_type, cycle, seq)
+                open_frames.setdefault((tid, frame_type), []).append(state)
+                current = state
+                totals, touched, pairs = None, [], 0
             else:
-                pending = frame_begins.get((tid, frame_type))
+                pending = open_frames.get((tid, frame_type))
                 if pending:
-                    begin_cycle = pending.pop(0)
+                    state = pending.pop(0)
+                    if state is current:
+                        _keep_totals(state, totals, touched, pairs)
                     frame_rows.append(FrameRow(
                         index=0, type=frame_type, tid=tid,
-                        begin_cycle=begin_cycle, end_cycle=cycle,
+                        begin_cycle=state.begin, end_cycle=cycle,
                     ))
+                    if attribute and cycle > state.begin:
+                        keeper.append(state.row(tid, cycle, _FRAME_WORK_TOP))
+                        if len(keeper) > _FRAME_WORK_KEEP:
+                            keeper.sort(key=lambda item: (
+                                -int(item["cycles"]), int(item["begin_cycle"]),
+                            ))
+                            del keeper[_FRAME_WORK_KEEP:]
+                    if current is state:
+                        current = _newest(open_frames)
+                        totals, touched, pairs = _live_totals(current)
                 else:
                     counts["unpaired_frame_end"] += 1
         elif full_name == "Misc.Bookmark":
@@ -354,12 +494,23 @@ def _walk_tid(
                 key = str(counter_id)
                 counter_values[key] = counter_values.get(key, 0) + 1
 
-    for pending in frame_begins.values():
+    for pending in open_frames.values():
         counts["unpaired_frame_begin"] += len(pending)
+    if attribute:
+        if current is not None:
+            _keep_totals(current, totals, touched, pairs)
+        counts["scope_pairs"] += attributed
+        counts["scope_pairs_spanning"] += spanning
+        counts["scope_pairs_no_spec"] += no_spec
+        counts["scope_ends_unpaired"] += ends_unpaired
+        counts["scope_begins_unpaired"] += len(stack)
+    keeper.sort(key=lambda item: (int(item["begin_cycle"]), int(item["type"])))
+    frame_work.extend(keeper)
 
     return ThreadShare(
         tid=tid, row=trow, counts=counts, uid_counts=uid_counts, counter_values=counter_values,
-        region_counts=region_counts, anomalies=anomalies, frames=frame_rows, bookmarks=bookmarks,
+        region_counts=region_counts, anomalies=anomalies, frames=frame_rows, frame_work=frame_work,
+        bookmarks=bookmarks,
     )
 
 
@@ -396,11 +547,13 @@ def _merge_share(acc: "ModelAcc", share: ThreadShare) -> None:
         acc["region_counts"][key] = acc["region_counts"].get(key, 0) + value
     acc["anomalies"].extend(share["anomalies"])
     acc["frames"].extend(share["frames"])
+    acc["frame_work"].extend(share["frame_work"])
     acc["bookmarks"].extend(share["bookmarks"])
 
 
 def _worker_init(registry: schema.SchemaRegistry,
-                 bookmark_specs: Dict[int, Tuple[str, str, int]]) -> None:
+                 bookmark_specs: Dict[int, Tuple[str, str, int]],
+                 spec_count: int) -> None:
     """Hand a worker the read-only context (spawn keeps no memory of the parent's).
 
     It *receives* the registry rather than rebuilding it, and that is a scar, not a style choice.
@@ -412,12 +565,15 @@ def _worker_init(registry: schema.SchemaRegistry,
     """
     _CONTEXT["registry"] = registry
     _CONTEXT["bookmark_specs"] = bookmark_specs
+    _CONTEXT["spec_count"] = spec_count
 
 
 def _worker_walk(unit: Tuple[int, bytes]) -> ThreadShare:
     """One work unit -- a thread id and its bytes -- walked in a worker process."""
     tid, stream = unit
-    return _walk_tid(tid, stream, _CONTEXT["registry"], _CONTEXT["bookmark_specs"])
+    return _walk_tid(
+        tid, stream, _CONTEXT["registry"], _CONTEXT["bookmark_specs"], _CONTEXT["spec_count"]
+    )
 
 
 def _parallel_shares(
@@ -425,6 +581,7 @@ def _parallel_shares(
     units: List[Tuple[int, bytes]],
     bookmark_specs: Dict[int, Tuple[str, str, int]],
     workers: int,
+    spec_count: int = 0,
     worker: Callable[[Tuple[int, bytes]], ThreadShare] = _worker_walk,
     stall_timeout: float = _STALL_TIMEOUT,
 ) -> List[ThreadShare]:
@@ -444,7 +601,9 @@ def _parallel_shares(
     if not units:
         return []
     pool = ProcessPoolExecutor(
-        max_workers=workers, initializer=_worker_init, initargs=(registry, bookmark_specs)
+        max_workers=workers,
+        initializer=_worker_init,
+        initargs=(registry, bookmark_specs, spec_count),
     )
     futures: List[Any] = []
     try:
@@ -637,17 +796,23 @@ def build_model(
 
     # -- every thread stream: what happened, one thread at a time (`--jobs` parallelises this bit)
     frame_rows: List[FrameRow] = []
+    frame_work: List[FrameWorkRow] = []
     bookmarks: List[BookmarkRow] = []
     units = [
         (tid, stream_set.streams[tid])
         for tid in sorted(stream_set.streams)
         if tid not in (TID_EVENTS, TID_IMPORTANTS)
     ]
+    # one past the highest spec id the capture declared: the array a frame's totals are counted in
+    spec_count = (max(timers) + 1) if timers else 0
     workers = _workers_for(units, jobs)
     if workers > 1:
-        shares = _parallel_shares(registry, units, bookmark_specs, workers)
+        shares = _parallel_shares(registry, units, bookmark_specs, workers, spec_count)
     else:
-        shares = [_walk_tid(tid, stream, registry, bookmark_specs) for tid, stream in units]
+        shares = [
+            _walk_tid(tid, stream, registry, bookmark_specs, spec_count)
+            for tid, stream in units
+        ]
     acc = ModelAcc(
         threads=threads,
         counts=counts,
@@ -656,6 +821,7 @@ def build_model(
         region_counts=region_counts,
         anomalies=anomalies,
         frames=frame_rows,
+        frame_work=frame_work,
         bookmarks=bookmarks,
     )
     for share in shares:
@@ -666,6 +832,9 @@ def build_model(
     frame_rows.sort(key=lambda row: (int(row["begin_cycle"]), int(row["type"]), int(row["tid"])))
     for index, row in enumerate(frame_rows):
         row["index"] = index
+    frame_work.sort(key=lambda row: (
+        int(row["begin_cycle"]), int(row["tid"]), int(row["type"]),
+    ))
     bookmarks.sort(key=lambda row: (int(row["cycle"]), int(row["point"])))
 
     last_cycle = 0
@@ -701,6 +870,7 @@ def build_model(
         threads=[threads[tid] for tid in sorted(threads)],
         timers=[timers[spec_id] for spec_id in sorted(timers)],
         frames=frame_rows,
+        frame_work=frame_work,
         bookmarks=bookmarks,
         counters=[counters[spec_id] for spec_id in sorted(counters)],
         counter_values=counter_values,

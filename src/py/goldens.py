@@ -33,10 +33,13 @@ CAPTURES_LOCAL_FILE = GOLDENS_DIR / "captures.local.json"
 LABELS_DIR = GOLDENS_DIR / "labels"
 TRANSCRIPTS_DIR = GOLDENS_DIR / "local"
 
-#: (name, argv after the capture path) -- each is pinned byte-for-byte.
+#: (name, argv after the capture path) -- each is pinned byte-for-byte. `summary` is pinned in its
+#: table form (prose, histogram and rows) because that is the whole report: the csv form would pin
+#: the table and drop the verdict.
 PINNED_COMMANDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("info", ()),
     ("verify", ()),
+    ("summary", ("--budget", "60")),
     ("threads", ("--format", "csv")),
     ("timers", ("--format", "csv", "--limit", "0")),
     ("frames", ("--format", "csv", "--limit", "0")),

@@ -120,7 +120,7 @@ CsvTools pipeline (README §2):
   Value)`.
 
 Corpus state: the definitions are present, the per-frame events are not — `editor-pie-1` ran
-with the CSV profiler *registered* but no CSV capture active (README §2, ROADMAP §1 and §14 want a
+with the CSV profiler *registered* but no CSV capture active (README §2; ROADMAP §12 wants a
 capture that has both). The engine's own reader of these events is
 `TraceServices\Private\Analyzers\CsvProfilerTraceAnalysis.cpp`, feeding the
 `CsvProfilerProvider` model.
@@ -161,28 +161,39 @@ specs, 27,760 timer specs (4,879 with file:line), 182 counter specs, session dur
 `verify` reports 0 errors and 0 warnings. These are the numbers the parser's golden output must
 reproduce (`goldens/labels/editor-pie-1.json` pins them).
 
-Cost, measured in this working tree on this machine (2026-09-28, a cold `verify`):
+Cost, measured in this working tree on this machine (2026-09-28, a cold `parse`, frame work
+attribution included — §10):
 
 | phase | serial | `--jobs 0` (the pool) |
 |---|---|---|
 | read the 34 MB file | 0.008 | 0.008 |
 | container header | 0.000 | 0.000 |
-| packets (163,600 headers) | 0.251 | 0.251 |
-| streams (LZ4: 24,767 blocks, 34.8 MB → 49.9 MB) | 0.599 | 0.599 |
-| model (the per-thread Python walk) | 9.560 | 4.140 |
-| **cold full decode** | **11.34** | **5.22** |
+| packets (163,600 headers) | 0.259 | 0.252 |
+| streams (LZ4: 24,767 blocks, 34.8 MB → 49.9 MB) | 0.617 | 0.616 |
+| model (the per-thread Python walk, attribution included) | 11.447 | 5.095 |
+| **cold full decode** | **12.33** | **5.97** |
 
-A cached command is **0.49 s** and `goldens --check` ~15 s (its transcripts are the pinned commands'
-real output, so it now runs a full `verify`).
+A cached command is **0.51 s** (`summary` included: the work it reports is in the cache, not
+re-derived) and `goldens --check` ~15 s (its transcripts are the pinned commands' real output, so
+it runs a full `verify`).
 
 Two histories are in that table. The LZ4 half is the C library (§2): with the pure-Python decoder
 the same cold decode was **21.3 s**. And the walk is per-thread work, so `--jobs` spreads it over
-processes — measured **9.56 / 5.41 / 4.14 / 4.16 / 4.15 s** at 1 / 2 / 4 / 8 / 12 workers. It stops
-at the *biggest* thread rather than at the core count: tid 2 owns 53.4% of the corpus's 10,055,971
-batch records, so the ceiling is that one thread, and `--jobs 0` (the default) caps its own choice
-at 8 workers — past that nothing improves here, while a capture whose work is spread evenly gets
-more of the box. The answer does not depend on `--jobs` at all: shares are merged by one function in
-ascending tid order, byte-for-byte into the cache's own format.
+processes — measured **11.45 / 5.10 s** at 1 and 0 workers, and **9.56 / 5.41 / 4.14 / 4.16 /
+4.15 s** before the attribution landed. It stops at the *biggest* thread rather than at the core
+count: tid 2 owns 53.4% of the corpus's 10,055,971 batch records, so the ceiling is that one
+thread, and `--jobs 0` (the default) caps its own choice at 8 workers — past that nothing improves
+here, while a capture whose work is spread evenly gets more of the box. The answer does not depend
+on `--jobs` at all: shares are merged by one function in ascending tid order, byte-for-byte into
+the cache's own format.
+
+**What the attribution costs** (§10): walking tid 2 alone — 5.49 M of those records, the biggest
+single unit — takes **3.87 s without it and 4.61 s with it (+19%)**, which is the +0.9 s the pool
+shows on the cold total. Two cheaper shapes were measured and rejected on the way: accumulating
+into a dict per frame (**+23%**) and writing every count into the walk's `counts` dict as it goes
+(the loop now keeps its totals and counters in locals and flushes them at the frame boundary and
+the end of the walk). The cost is paid once per capture, by the parse that fills the cache, and a
+warm `summary` is the same 0.51 s as any other cached command.
 
 ## 7. Where the format is defined (engine source tree)
 
@@ -201,6 +212,11 @@ Paths are relative to the engine source tree root.
 | `Engine\Source\Runtime\TraceLog\Private\Trace\Field.cpp` | how aux data is segmented: a header per segment, each carrying the same field index |
 | `Engine\Source\Runtime\TraceLog\Private\Trace\LZ4\` | the engine's own vendored LZ4 (v1.9.2 — the same version `src/cpp/third_party/lz4` carries) which compresses the packets §2 decodes |
 | `Engine\Source\Runtime\TraceLog\Public\Trace\Detail\Important\ImportantLogScope.inl` | the important streams' own aux framing (unshifted uids, a terminal after every field) |
+| `Engine\Source\Runtime\Core\Public\ProfilingDebugging\CpuProfilerTrace.h` | timer specs (name + file + line), the scope API |
+| `Engine\Source\Runtime\Core\Public\ProfilingDebugging\CsvProfilerTrace.h` | the CSV Profiler's events — they ride the `counters` channel (§5) |
+| `Engine\Source\Developer\TraceAnalysis\Private\Analysis\Engine.cpp` | the reader our parser mirrors: magic/metadata stages, packet transport, event parsing, the serial min-heap |
+| `Engine\Source\Developer\TraceServices\Private\Analyzers\CpuProfilerTraceAnalysis.cpp` | the engine's own batch decoder: a begin record carries a spec id, an end record does not (§3, §10) |
+| `Engine\Source\Developer\TraceServices\Private\Analyzers\CsvProfilerTraceAnalysis.cpp` | the engine's own analysis of that channel |
 
 ## 8. The channels, and what each one lets you answer
 
@@ -208,7 +224,7 @@ A capture carries only what it was recorded with (`-trace=<id>,<id>...`; the mac
 channel are `UE_TRACE_CHANNEL*` in `Runtime\TraceLog\Public\Trace\Trace.h`). This is the inventory
 of what the engine can emit — gathered from the tree on 2026-09-28, grouped by the question it
 answers, with the engine analyser to mirror for field-level truth. **An absent channel is not a
-zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §9).
+zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §8).
 
 | Channel | Carries | Answers | Engine analyser to mirror |
 |---|---|---|---|
@@ -259,8 +275,55 @@ The corpus (`editor-pie-1`) carries `cpu` (scopes), `frame`, `log`, `bookmark`, 
 
 Also prebuilt in this checkout and worth a look later: `iostore_analysis.exe`,
 `AnalysisTabUtils.exe` (`Engine\Binaries\Win64`).
-| `Engine\Source\Developer\TraceServices\Private\Analyzers\CpuProfilerTraceAnalysis.cpp` | the engine's own batch decoder: a begin record carries a spec id, an end record does not |
-| `Engine\Source\Developer\TraceAnalysis\Private\Analysis\Engine.cpp` | the reader our parser mirrors: magic/metadata stages, packet transport, event parsing, the serial min-heap |
-| `Engine\Source\Runtime\Core\Public\ProfilingDebugging\CpuProfilerTrace.h` | timer specs (name + file + line), the scope API |
-| `Engine\Source\Runtime\Core\Public\ProfilingDebugging\CsvProfilerTrace.h` | the CSV Profiler's events — they ride the `counters` channel (§5) |
-| `Engine\Source\Developer\TraceServices\Private\Analyzers\CsvProfilerTraceAnalysis.cpp` | the engine's own analysis of that channel |
+
+## 10. The frame-time summary (`summary`) — what its words mean
+
+The practice this layer answers to (ROADMAP, "What professional performance work looks like") is
+blunt about the shape of the answer: **the distribution, never the average** — "a 16.6 ms average
+with 50 ms spikes feels terrible" — against an explicit target, with a count of the frames that miss
+it and the timers that own them. Every word in that sentence is defined here.
+
+* **A frame** is one `Misc.BeginFrame`/`Misc.EndFrame` pair of one thread and frame type, and its
+  time is `end_cycle - begin_cycle` divided by the capture's `session.cycle_frequency`. The engine's
+  own frame track draws the same pair. The corpus has 1,413 pairs on tid 2 (frame type 0) and 1,413
+  more on tid 98 (type 1), spanning 217.2 s of the capture's 332.1 s.
+* **One series, never a pool of them.** A report judges the *busiest* (thread, frame type), and
+  `--tid` names another on purpose: the corpus's game and render threads are different clocks, and
+  averaging them into one distribution would describe neither. Cycles are not milliseconds without a
+  cycle frequency, so a capture that has none cannot be summarised at all (exit 2, not a guess).
+* **Percentiles are nearest-rank**: p_q of n values is the value at rank `ceil(q*n)` in sorted
+  order — a real frame's time, never an interpolation between two frames that never happened, which
+  is what a CI gate means by "p99 10% worse than the baseline". The corpus: mean 153.702 ms, min
+  4.708, **p50 33.414, p95 333.408, p99 334.328, max 121,484.003** — the shape is an editor session
+  (frames clustered at 33 ms and at 333 ms, plus one 121-second stall), and the mean belongs to no
+  frame at all. The mean is printed, and it is never the verdict.
+* **A hitch is `HITCH_FACTOR` (2) budgets**: 33.333 ms at 60 FPS — the threshold the CI literature
+  counts — so the count is budget-relative (`--budget 30` makes a hitch a frame over 66.667 ms).
+  `--budget FPS` and `--budget-ms MS` are two spellings of one thing: giving both is a usage error
+  rather than one of them winning, and neither means 60 FPS, which the report prints.
+* **The histogram's bins double from half the budget** (`budget/2`, `budget`, `2 x budget`, …, at
+  most 16, the last one open-ended), because a linear axis would put every frame of a
+  hitch-ridden capture in its first bin.
+* **What ran in a frame** comes from the batch records (§3): the walk pairs each begin with its
+  end — the wire carries a spec id only on the begin — and attributes the pair's **inclusive**
+  cycles (a scope that contains another counts its children too) to the frame that was open when
+  the pair *ended*. The report's percentage is of the frame's own span, so inclusive shares can add
+  up past 100%; that is the point: the timer that owns the frame reads as one number.
+* **What could not be attributed is counted, never guessed.** Five model counters carry it, and
+  `verify` prints them whenever a capture has frames:
+  `scope_pairs` (attributed), `scope_pairs_spanning` (began before the frame that ended them),
+  `scope_pairs_no_spec` (a V3 coroutine record, which has no spec id on the wire, or an id the
+  capture never declared), `scope_ends_unpaired`, `scope_begins_unpaired`. Pairs that lie outside
+  every frame — before the first `BeginFrame`, after the last `EndFrame` — are not counted at all:
+  the frame is what is being attributed to.
+* **The work kept is a sample by construction**: the **16 longest frames of each thread**, up to 6
+  timers each (`model._FRAME_WORK_KEEP`, `_FRAME_WORK_TOP`), live in the model — so `summary` on a
+  warm cache costs what any other cached command costs (0.51 s, §6) and never re-walks the file. A
+  table row for a frame whose work was not kept prints `-`, and the prose says why.
+* **The cross-check this owes.** The bar set for this layer is that our numbers agree with
+  `TimingInsights.ExportTimerStatistics` where the columns overlap. That export needs a *built*
+  UnrealInsights and this checkout has none, so the check is **not run here** — what is stated
+  instead is the definitional overlap: a frame time is the BeginFrame/EndFrame span the engine's
+  frame track draws, and a timer is a `CpuProfiler` batch scope named by the capture's own spec
+  table, which is what that export enumerates. When an engine build exists on the machine, that
+  export is the comparison to run (README §3).

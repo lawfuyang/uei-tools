@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple, TypedDict
 
 TOOL_NAME = "ueia"
-TOOL_VERSION = "0.1.0"
+#: 0.2.0 added `frame_work` to the model (the per-frame work attribution the summary reports).
+#: The cache is keyed by this string, so the bump is what stops a model built by 0.1.0 -- which has
+#: no frame work in it -- from being read back and reported as a capture that had none.
+TOOL_VERSION = "0.2.0"
 CACHE_FORMAT = 1
 
 MAGIC = b"2CRT"
@@ -235,6 +238,31 @@ class FrameRow(TypedDict):
     tid: int
     begin_cycle: int
     end_cycle: int
+
+
+class FrameWorkRow(TypedDict):
+    """What one frame was spent on: the scope pairs attributed to it, biggest first.
+
+    The walk keeps this only for the **longest frames of each thread** (`model._FRAME_WORK_KEEP`),
+    because the frame-time report asks about the tail -- a capture with a hundred thousand frames
+    must not put a hundred thousand of these in the cache to answer a question about its worst
+    twenty. So this is a sample by construction, and a command that lists a frame without one says
+    so rather than reporting an empty frame.
+
+    `cycles` is the frame's own duration (`end_cycle - begin_cycle`); each item is a timer spec id
+    and the **inclusive** cycles attributed to it -- a scope that contains another counts its
+    children's time too, which is what "this timer owns the frame" means. The times of the items in
+    one frame can therefore add up to more than the frame, and a pair that began before the frame
+    is counted (`scope_pairs_spanning`) rather than attributed.
+    """
+
+    tid: int
+    type: int
+    begin_cycle: int
+    end_cycle: int
+    cycles: int
+    pairs: int
+    items: List[Tuple[int, int]]
 
 
 class BookmarkRow(TypedDict):

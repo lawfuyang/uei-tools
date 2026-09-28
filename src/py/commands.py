@@ -28,6 +28,7 @@ import csvprof
 import engine
 import lz4
 import schema
+import summary
 import timing
 import toolrun
 import streams
@@ -47,6 +48,8 @@ from shapes import (
 FORMATS = ("table", "csv", "markdown")
 _VALUE_OPTIONS = frozenset((
     "format", "limit", "tid", "filter", "jobs", "engine-dir",
+    # the summary layer: a budget in either of the two spellings the practice uses
+    "budget", "budget-ms",
     # the csv family: ours on the left, the exe's own flag in `_csv_*` below
     "out", "json", "stat", "stats", "csvs", "dir", "pattern", "outlier-stat", "outlier-threshold",
     "metadata-filter", "start-event", "in", "out-format", "compress", "set-metadata", "batch",
@@ -63,6 +66,9 @@ _BOOL_OPTIONS = frozenset((
 
 _DEFAULT_PACKET_LIMIT = 40
 _DEFAULT_FRAME_LIMIT = 40
+#: How many over-budget frames `summary` lists by default. Ten fits a page and is the worst of the
+#: tail, which is what the practice says to look at; `--limit 0` asks for every one of them.
+_DEFAULT_BREAKER_LIMIT = 10
 _MAX_LISTED_ANOMALIES = 40
 
 _ERROR_KINDS = frozenset((
@@ -514,6 +520,122 @@ def cmd_frames(capture: str, args: List[str]) -> int:
     return 0
 
 
+def cmd_summary(capture: str, args: List[str]) -> int:
+    """`summary <capture> [--budget FPS|--budget-ms MS] [--tid N] [--limit N]`: is this capture fast?
+
+    The session at a glance, the frame-time distribution against an explicit budget, and the frames
+    that break it -- worst first, each naming the timers that ran in it. The distribution is the
+    answer, never its mean (REFERENCE §10 and `summary.py` have the definitions); the table is
+    rendered like every row command, prose included.
+
+    Exit codes: 0 a report was produced, 2 the capture cannot answer a frame-time question (no
+    `Misc.BeginFrame` pairs, or no cycle frequency -- cycles are not milliseconds without it), 1 a
+    failure. Being *over* budget is not a failure: it is the report.
+    """
+    options = parse_options(args)
+    if options.values.keys() - {"budget", "budget-ms", "tid", "limit", "format", "jobs"} \
+            or options.flags:
+        raise UsageError(
+            "summary takes --budget, --budget-ms, --tid, --limit, --format and --jobs"
+        )
+    budget = summary.parse_budget(options.values.get("budget"), options.values.get("budget-ms"))
+    limit = options.number("limit", _DEFAULT_BREAKER_LIMIT)
+    tid = options.number("tid", -1)
+    _view, model, _cached = load_model(capture, _jobs(options))
+    series = summary.series_of(model, None if tid < 0 else tid)
+    lines: List[str] = []
+    if series is None:
+        lines.append(
+            "frames    : none -- this capture carries no Misc.BeginFrame/EndFrame pair%s"
+            % (" on tid %d" % (tid,) if tid >= 0 else "",)
+        )
+        lines.append("hint      : a frame-time report needs a capture recorded with -trace=cpu,frame")
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        return 2
+    times = summary.times_ms(model, series.rows)
+    frequency = int(model.get("session", {}).get("cycle_frequency", 0) or 0)
+    if times is None:
+        lines.append("frames    : %s" % (series.describe(),))
+        lines.append(
+            "frequency : 0 -- the capture declares no cycle frequency, so frame times cannot be "
+            "stated in milliseconds"
+        )
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        return 2
+    distribution = summary.distribute(times, budget)
+    session = model.get("session", {})
+    duration = seconds_for_cycle(model, int(session.get("last_cycle", 0)))
+    names = {int(row.get("id", 0)): str(row.get("name", "")) for row in model.get("timers", [])}
+    counts = _counts(model)
+    lines.append("capture   : %s%s" % (
+        _view.path.name, ", %.3f s" % (duration,) if duration is not None else "",
+    ))
+    identity = " / ".join(
+        part for part in (
+            str(session.get("app", "")), str(session.get("project", "")),
+            str(session.get("target", "")),
+        ) if part
+    )
+    if identity:
+        build = str(session.get("build_version", ""))
+        configuration = str(session.get("configuration", ""))
+        qualifiers = ", ".join(part for part in (configuration, build) if part)
+        lines.append("session   : %s%s" % (identity, " (%s)" % (qualifiers,) if qualifiers else ""))
+    lines.append("frames    : %s, spanning %s" % (
+        series.describe(), "%.3f s" % (series.span_s,) if series.span_s is not None else "?",
+    ))
+    lines.append("budget    : %s; a hitch is a frame over %.3f ms" % (
+        budget.label(), budget.ms * summary.HITCH_FACTOR,
+    ))
+    lines.append("time      : mean %.3f, min %.3f, p50 %.3f, p95 %.3f, p99 %.3f, max %.3f ms" % (
+        distribution["mean_ms"], distribution["min_ms"], distribution["p50_ms"],
+        distribution["p95_ms"], distribution["p99_ms"], distribution["max_ms"],
+    ))
+    lines.append("verdict   : %s" % (summary.verdict_text(distribution, budget),))
+    lines.append("histogram :")
+    lines.extend(summary.histogram_lines(summary.histogram(times, budget.ms)))
+    lines.append("work      : %d scope pair(s) attributed (%d spanning a frame edge, %d with no "
+                 "spec, %d unpaired end(s), %d unpaired begin(s)); the work column is filled for "
+                 "the longest frames only" % (
+                     counts.get("scope_pairs", 0), counts.get("scope_pairs_spanning", 0),
+                     counts.get("scope_pairs_no_spec", 0), counts.get("scope_ends_unpaired", 0),
+                     counts.get("scope_begins_unpaired", 0),
+                 ))
+    over = [
+        (row, ms) for row, ms in zip(series.rows, times) if ms > budget.ms
+    ]
+    over.sort(key=lambda item: (-item[1], int(item[0].get("begin_cycle", 0))))
+    shown = over if limit == 0 else over[:limit]
+    rows: List[Tuple[str, ...]] = []
+    for row, ms in shown:
+        work = summary.frame_work_of(
+            model, series.tid, series.type, int(row.get("begin_cycle", 0)),
+        )
+        at = seconds_for_cycle(model, int(row.get("begin_cycle", 0)))
+        rows.append((
+            str(row.get("index", 0)),
+            "-" if at is None else "%.3f" % (at,),
+            "%.3f" % (ms,),
+            "%.2f" % (ms / budget.ms,),
+            summary.work_text(work, names, frequency, int(row.get("end_cycle", 0))
+                              - int(row.get("begin_cycle", 0))),
+        ))
+    if over and not shown:
+        lines.append("note      : %d frame(s) over budget, none shown (--limit 0 lists them all)" % (
+            len(over),
+        ))
+    render_rows(
+        ("frame", "at s", "ms", "x budget", "top work"),
+        rows,
+        (True, True, True, True, False),
+        options.fmt(),
+        lines,
+    )
+    return 0
+
+
 def cmd_verify(capture: str, args: List[str]) -> int:
     """`verify <capture>`: walk everything and say what does not add up.
 
@@ -577,6 +699,15 @@ def cmd_verify(capture: str, args: List[str]) -> int:
             counts.get("bookmarks", 0), counts.get("unknown_bookmark_points", 0),
         ),
     ]
+    if model.get("frames"):
+        lines.append(
+            "work      : %d scope pair(s) attributed to frames (%d spanning a frame edge, %d with "
+            "no spec), %d unpaired end(s), %d unpaired begin(s)" % (
+                counts.get("scope_pairs", 0), counts.get("scope_pairs_spanning", 0),
+                counts.get("scope_pairs_no_spec", 0), counts.get("scope_ends_unpaired", 0),
+                counts.get("scope_begins_unpaired", 0),
+            )
+        )
     if serial_carried and missing:
         lines.append(
             "note      : holes in the serial range are expected only before the first sync "
@@ -1183,6 +1314,7 @@ __all__ = [
     "cmd_threads",
     "cmd_timers",
     "cmd_frames",
+    "cmd_summary",
     "cmd_verify",
     "cmd_parse",
     "cmd_cache",
