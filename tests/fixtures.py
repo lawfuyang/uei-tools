@@ -353,6 +353,69 @@ def work_importants() -> bytes:
     )
 
 
+def mapped_importants() -> bytes:
+    """Four located specs (two engine files, one engine module twice, one project plugin) and a fifth
+    with no file at all: the source-mapping fixture's whole vocabulary.
+
+    1 cycle is 1 microsecond here (`NewTrace` declares 1,000,000), so every number in
+    `mapped_stream` is a round millisecond and `test_sources` pins the report against it.
+    """
+    engine = "D:\\Build\\UnrealEngine\\Engine"
+    return (
+        important_record(16, pack("u64", 1000000) + pack("u64", 1000000))
+        + important_record(17, pack("u32", 2) + important_aux_block(1, b"GameThread"))
+        + important_record(20, pack("u32", 8) + pack("u32", 100)
+                           + important_aux_block(1, b"UWorld::Tick")
+                           + important_aux_block(
+                               2, (engine + "\\Source\\Runtime\\Engine\\Private\\World.cpp")
+                               .encode("utf-8")))
+        + important_record(20, pack("u32", 9) + pack("u32", 200)
+                           + important_aux_block(1, b"StaticLoadObjectInternal")
+                           + important_aux_block(
+                               2, (engine + "\\Source\\Runtime\\CoreUObject\\Private\\UObject\\"
+                                        "UObjectGlobals.cpp").encode("utf-8")))
+        + important_record(20, pack("u32", 10) + pack("u32", 300)
+                           + important_aux_block(1, b"FTimerManager_Tick")
+                           + important_aux_block(
+                               2, (engine + "\\Source\\Runtime\\Engine\\Private\\TimerManager.cpp")
+                               .encode("utf-8")))
+        + important_record(20, pack("u32", 11) + pack("u32", 400)
+                           + important_aux_block(1, b"WaitForTasks")
+                           + important_aux_block(
+                               2, (b"D:\\Studio\\Game\\Plugins\\Perf\\Source\\PerfCore\\Private\\"
+                                   b"Waits.cpp")))
+        + important_record(20, pack("u32", 12) + pack("u32", 500)
+                           + important_aux_block(1, b"Anonymous"))
+    )
+
+
+def mapped_stream() -> bytes:
+    """One 101 ms frame holding four scopes: 28 ms of `UWorld::Tick` (with 15 ms of a synchronous
+    load nested inside it), 10 ms of `FTimerManager_Tick` and 20 ms of `WaitForTasks`."""
+    return (
+        event(22, pack("u64", 1000000) + pack("u8", 0), serial=1)
+        + parallel_records([
+            (1002000, 8, True),       # UWorld::Tick      1,002,000 -> 1,030,000
+            (1005000, 9, True),       # StaticLoad...     1,005,000 -> 1,020,000, inside it
+            (1020000, None, False),
+            (1030000, None, False),
+            (1040000, 10, True),      # FTimerManager_Tick 1,040,000 -> 1,050,000
+            (1050000, None, False),
+            (1060000, 11, True),      # WaitForTasks       1,060,000 -> 1,080,000
+            (1080000, None, False),
+        ])
+        + event(23, pack("u64", 1101000) + pack("u8", 0), serial=2)
+    )
+
+
+def mapped_trace() -> bytes:
+    """A capture whose timers carry source locations: the fixture `test_sources` is pinned against."""
+    return build_trace(
+        events_stream=work_schema(), importants_stream=mapped_importants(),
+        threads={2: mapped_stream()},
+    )
+
+
 def parallel_schema() -> bytes:
     """`work_schema` plus a second thread's scopes: the vocabulary a parallelism report needs."""
     return work_schema()

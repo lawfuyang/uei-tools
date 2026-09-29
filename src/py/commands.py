@@ -31,6 +31,7 @@ import engine
 import lz4
 import parallel
 import schema
+import sources
 import summary
 import tasks
 import timing
@@ -78,6 +79,8 @@ _DEFAULT_THREAD_LIMIT = 20
 #: How many over-budget frames `summary` lists by default. Ten fits a page and is the worst of the
 #: tail, which is what the practice says to look at; `--limit 0` asks for every one of them.
 _DEFAULT_BREAKER_LIMIT = 10
+#: How many source files `sources` lists by default: a page of the files that own the most work.
+_DEFAULT_FILE_LIMIT = 40
 _MAX_LISTED_ANOMALIES = 40
 
 _ERROR_KINDS = frozenset((
@@ -544,6 +547,73 @@ def cmd_frames(capture: str, args: List[str]) -> int:
         (True, True, True, True, True, True),
         options.fmt(),
         prose,
+    )
+    return 0
+
+
+def cmd_sources(capture: str, args: List[str]) -> int:
+    """`sources <capture> [--engine-dir DIR] [--filter TEXT] [--limit N]`: where the timers live.
+
+    The trace's own file:line for every timer spec that carries one, classified into engine vs
+    project by the **shape** of the path (the recorded paths belong to the machine that recorded it),
+    weighted by the work the model keeps for the longest frames, and cross-referenced with the
+    engine's own anti-pattern names. `--engine-dir` is optional and only ever *checks*: how many of
+    the recorded engine paths exist in the tree at hand, which is a version-mismatch signal and not a
+    requirement (`sources.py` has the rules).
+
+    Exit codes: 0 a report was produced, 2 the capture cannot answer (no timer specs at all, or none
+    of them carries a file:line), 1 a failure.
+    """
+    options = parse_options(args)
+    if options.values.keys() - {"engine-dir", "filter", "limit", "budget", "budget-ms", "format",
+                                "jobs"} or options.flags:
+        raise UsageError(
+            "sources takes --engine-dir, --filter, --limit, --budget, --budget-ms, --format and "
+            "--jobs"
+        )
+    budget = summary.parse_budget(options.values.get("budget"), options.values.get("budget-ms"))
+    limit = options.number("limit", _DEFAULT_FILE_LIMIT)
+    root, notes = _engine_dir(options)
+    view, model, _cached = load_model(capture, _jobs(options))
+    report, reasons = sources.build(model, budget, root)
+    if report is None:
+        lines = ["capture   : %s" % (view.path.name,)]
+        lines.extend(notes)
+        for reason in reasons:
+            lines.append("cannot    : %s" % (reason,))
+        lines.append("hint      : a source mapping needs the capture's own spec table; it is what "
+                     "-trace=cpu writes, with symbols")
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        return 2
+    session = model.get("session", {})
+    duration = seconds_for_cycle(model, int(session.get("last_cycle", 0)))
+    lines = ["capture   : %s%s" % (
+        view.path.name, ", %.3f s" % (duration,) if duration is not None else "",
+    )]
+    identity = " / ".join(
+        part for part in (
+            str(session.get("app", "")), str(session.get("project", "")),
+            str(session.get("target", "")),
+        ) if part
+    )
+    if identity:
+        build = str(session.get("build_version", ""))
+        configuration = str(session.get("configuration", ""))
+        qualifiers = ", ".join(part for part in (configuration, build) if part)
+        lines.append("session   : %s%s" % (identity, " (%s)" % (qualifiers,) if qualifiers else ""))
+    lines.extend(notes)
+    frequency = int(session.get("cycle_frequency", 0) or 0) if isinstance(session, dict) else 0
+    prose, rows = sources.summarize_lines(
+        report, frequency, limit, options.text("filter"),
+    )
+    lines.extend(prose)
+    render_rows(
+        ("file:line", "side", "module", "specs", "share", "over", "top timer"),
+        rows,
+        (False, False, False, True, True, True, False),
+        options.fmt(),
+        lines,
     )
     return 0
 
@@ -1245,7 +1315,7 @@ def _csv_emit(lines: Sequence[str], code: int, verdict: bool = False) -> int:
     return code
 
 
-def _csv_engine(options: Options) -> Tuple[Optional[engine.EngineDir], List[str]]:
+def _engine_dir(options: Options) -> Tuple[Optional[engine.EngineDir], List[str]]:
     """The engine tree for this call, plus anything that has to be said out loud about it."""
     notes: List[str] = []
     return engine.resolve(options.text("engine-dir") or None, notes=notes), notes
@@ -1273,7 +1343,7 @@ def _csv_run(exe_name: str, argv: List[str], options: Options,
     is why every path in `argv` is made absolute first. `toolrun.run_tool` is what the tests patch:
     the exes are the engine's, not ours, so their half of the suite is the *not compared* half.
     """
-    root, notes = _csv_engine(options)
+    root, notes = _engine_dir(options)
     if root is None:
         return _csv_skipped(exe_name, root, notes)
     exe = root.csvtools(exe_name)
@@ -1681,6 +1751,7 @@ __all__ = [
     "cmd_frames",
     "cmd_bottleneck",
     "cmd_parallelism",
+    "cmd_sources",
     "cmd_summary",
     "cmd_tasks",
     "cmd_verify",

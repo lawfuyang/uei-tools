@@ -11,7 +11,7 @@ Any change to `src/py/` or `tests/` is not finished until all three pass:
 
 ```powershell
 python src\py\ueia.py lz4 --build       # step 0: bin/ueia_lz4.dll, built only when stale
-python src\py\ueia.py selftest          # the hermetic suite: ~80 s (the corpus half dominates), exit 0 pass / 1 fail / 2 bad option
+python src\py\ueia.py selftest          # the hermetic suite: ~100 s (the corpus half dominates), exit 0 pass / 1 fail / 2 bad option
 npx --yes pyright@latest                # must print: 0 errors, 0 warnings
 python src\py\ueia.py goldens --check   # the corpus: exit 0 matched / 1 a problem / 2 nothing to compare
 ```
@@ -49,10 +49,11 @@ measurement every thread's timeline is folded into) → `model` (the session mod
 per-frame work attribution, the occupancy and the coverage timelines) → `summary` (the budget,
 percentiles and histograms a frame-time report is defined by) → `bottleneck` (the classification
 on top of them: what bounds a frame) → `parallel` (the same measurements, asked who worked: solo
-work, simultaneity, contention) → `tasks` (the task channel's graph, its critical path, and the
-DOT/Mermaid exports) → `cache` (the parse cache) → `goldens` (the corpus harness) → `commands`
-(the commands and their rendering) → `ueia.py` (the CLI, which re-exports them all for scripts
-and tests).
+work, simultaneity, contention) → `sources` (the spec table's file:line, mapped into engine vs
+project and cross-referenced with the engine's anti-pattern names) → `tasks` (the task channel's
+graph, its critical path, and the DOT/Mermaid exports) → `cache` (the parse cache) → `goldens`
+(the corpus harness) → `commands` (the commands and their rendering) → `ueia.py` (the CLI, which
+re-exports them all for scripts and tests).
 
 Two names are deliberately *not* the obvious ones, and the reasons are measured:
 `types.py` is impossible — the interpreter preloads the stdlib `types`, so `import types` would
@@ -223,6 +224,13 @@ suite's real numbers — test count, pass/fail, pyright errors — not "passes".
   one), and an absent input stays absent — a capture records no core count, so oversubscription is
   "cannot be judged here", and a lock whose name the heuristic does not recognise is "invisible",
   never "no contention". The same shape as the bottleneck's rule about a missing GPU channel.
+* **Never sum inclusive cycles across scopes.** The model's per-frame work is inclusive (a scope
+  counts its children), so adding it up per file, module or pattern produces a number no frame ever
+  contained — measured: `Runtime/CoreUObject` sums to 306,239 s of a 332 s capture. Anything that
+  aggregates a group of timers takes **the biggest match inside each frame and sums those across
+  frames** (`sources.Weights.presence`), which is bounded by the frames' own span and is a lower
+  bound on the group's presence. A share that cannot exceed 100% is the point; the call tree
+  (ROADMAP, self time) is what will make the other question answerable.
 * **One machine, offline.** No network, no device, no live connections — see ROADMAP's not-list
   before proposing work that needs one.
 
@@ -259,7 +267,8 @@ mode, zero errors and zero warnings.
   format, decoded: container, packets, event streams, schema incl. the CSV Profiler's events,
   the engine file map, corpus measurements, §10's definitions of what a frame-time report
   means by a frame, a percentile, a hitch and "what ran in it", §11's bottleneck verdict, §12's
-  task graph and §13's coverage timeline with the parallelism report it feeds), `ROADMAP.md` (build order,
+  task graph, §13's coverage timeline with the parallelism report it feeds and §14's source
+  mapping), `ROADMAP.md` (build order,
   P-labels, scope, the not-list — landed items are removed, cross-references updated in the same
   change), `AGENTS.md` (this file).
 * Nothing that belongs to one machine's working tree is committed — local state (the parse

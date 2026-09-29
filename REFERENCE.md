@@ -599,3 +599,66 @@ this report a reader is meant to act on.
 
 Cost: §6 — the timeline is ~1.2 s of the walk and the folding is 2.40 s of a cold parse, once per
 capture; a warm `parallelism` is 0.33 s.
+
+## 14. Source mapping (`sources`) — where a timer lives, and what its weight means
+
+Every `CpuProfiler.EventSpec` carries a name, a file and a line (§3), and on the corpus 4,879 of
+27,760 specs carry all three. `ueia sources` turns those strings into the answers a reader acts on —
+*engine or project, which module, which file, and how much of the measured work it held* — and
+cross-references the engine's own anti-pattern names. Three things define it, and the first two are
+about not pretending:
+
+* **The path is classified by its shape, never by this machine.** The strings are the *recording*
+  machine's absolute paths (`D:\TikiStarMain_TMR\UnrealEngine\Engine\Source\Runtime\...`), which no
+  tree on this machine contains. What is portable is the structure the engine itself enforces:
+  `Engine` followed by `Source` or `Plugins` is the engine root (the *first* such pair — a module
+  called `Engine` must not shadow it); `<root>\Engine\Source\<Group>\<Module>\Public|Private\...` is
+  engine code; `<root>\Engine\Plugins\<Category>\<Plugin>\Source\<Module>\...` an engine plugin;
+  `<project>\Plugins\<...>\Source\<Module>\...` a project plugin; a path with no `Source` segment at
+  all — a bare file name, which is what a stripped build records — is **unknown**, and the report
+  says unknown rather than guessing. Matching is case-insensitive; the spelling printed is the
+  capture's own.
+* **The engine tree only ever *checks*.** `--engine-dir` (or `$UEI_ENGINE_DIR`, `engine.py`) resolves
+  the recorded engine paths against a tree and reports how many exist: on this machine **2,734 of the
+  editor capture's 3,605** engine paths are in the 5.8.3 tree — a revision signal (871 are not, and
+  the capture was recorded from another build) and never a requirement, because the mapping above
+  needs no tree. A flag naming something that is not an engine tree is a usage error; the mapping
+  without a tree says so in its own line.
+* **A group's weight is a *presence*, not a sum.** The cycles come from `model["frame_work"]`: the
+  biggest few timers of each of the longest frames of each thread (`_FRAME_WORK_KEEP`,
+  `_FRAME_WORK_TOP`), **inclusive**, so a scope and its nested children both count the same cycles.
+  Summing those per file or module is arithmetic and not an answer — measured on the corpus,
+  `Runtime/CoreUObject` sums to **306,239 s of a 332 s capture**. So a file, a module and a pattern
+  are all weighted by **the biggest matching timer inside each frame, summed over the frames**:
+  bounded by the frames' own span (the walk clips a pair to the window it ended in), so the share
+  stays a share, and it is a **lower bound** on the group's presence rather than an overstatement.
+  The corpus: the biggest located timer is **96.6%** of the kept frames' span, and the mapping covers
+  17.6% of the specs — the ones with a location own almost all of the measured work.
+
+The anti-pattern rules are name rules, and the report calls them heuristics where it prints them:
+
+| rule | names it matches | the guidance it is standing in for |
+|---|---|---|
+| `tick` | `tick` anywhere in the name | per-frame work in `Tick`: the engine's own "do less every frame" advice |
+| `sync-load` | `StaticLoadObject`, `LoadObject`, `LoadPackage`, `FlushAsyncLoading`, `SynchronousLoading`, `LoadMap`, `GetOrLoad` | loading on the calling thread — the hitch that is not a hitch to profile, it is a decision |
+| `object-churn` | `NewObject`, `SpawnActor`, `ConstructObject`, `CreateDefaultSubobject`, `DuplicateObject` | constructing objects and actors inside a frame |
+| `gc` | `CollectGarbage`, `GarbageCollect`, `GCLock`, `IncrementalPurge` | garbage collection in a frame |
+| `serialize` | `Serialize` | asset serialization on the calling thread |
+| `wait` | `WaitForTasks`, `WaitFor` | a frame waiting — the same finding §13 reaches from the occupancy side |
+
+A rule is only printed when at least `PATTERN_MIN_SPECS` (2) specs match it: one `Tick` timer is a
+timer, not a pattern. Each finding carries the cycles of its biggest match in each frame, how many of
+the kept frames are over budget, and the file:line of its biggest match, so the reader has somewhere
+to go. What the corpus shows (editor capture, `--budget 60`): `wait` 48 specs at **49.5%** of the kept
+frames with 17 over budget (`WaitForTasks`, `Runtime/Core/Private/Async/TaskGraph.cpp:734`);
+`sync-load` 8 specs at **42.9%** (`StaticLoadObjectInternal`, `.../UObjectGlobals.cpp:1370`); `tick`
+231 specs but **0.8%**, because the frames the model keeps for this capture are its loading stall and
+not its steady state — a fact about the sample, said where it is printed. In the game capture the
+whole picture is the opposite one: 1,352 of its located specs are engine code and none is project
+source (a packaged build's scopes are the engine's), 83.2% of the kept frames are inside
+`WaitForTask`-style scopes, and 31 of 32 are over budget — the same verdict §11's bottleneck report
+reaches from the timing side, reached here from the names.
+
+Cost: nothing measurable. This report adds no model field and reads no new bytes — the specs' file
+and line were already in the cache (§3) — so a warm `sources` is the same 0.3 s as any other cached
+command, and the cache version did not change for it.

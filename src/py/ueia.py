@@ -37,6 +37,12 @@ Commands:
                               and every absence said out loud (--budget, --budget-ms,
                               --tid, --limit; exit 2 when the capture has no frames, no
                               cycle frequency or no scopes)
+  sources <capture>           where the timers live: the trace's own file:line mapped
+                              into engine vs project by the shape of the path, weighted
+                              by the work the model keeps, and cross-referenced with
+                              the engine's anti-pattern names (--engine-dir DIR verifies
+                              the recorded paths against a tree, --filter TEXT, --limit N;
+                              exit 2 when no spec carries a file:line)
   verify <capture>            walk everything and report what does not add up
                               (exit 1 when anything error-level was found)
   parse <capture>             build (and cache) the session model; prints what it holds
@@ -115,6 +121,7 @@ from commands import (
     cmd_parse,
     cmd_schema,
     cmd_selftest,
+    cmd_sources,
     cmd_summary,
     cmd_tasks,
     cmd_threads,
@@ -135,6 +142,7 @@ _CAPTURE_COMMANDS = {
     "bottleneck": cmd_bottleneck,
     "summary": cmd_summary,
     "parallelism": cmd_parallelism,
+    "sources": cmd_sources,
     "tasks": cmd_tasks,
     "verify": cmd_verify,
     "parse": cmd_parse,

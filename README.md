@@ -149,6 +149,7 @@ three). Commands that need engine-provided tooling will take `--engine-dir` (or 
 | `tasks <capture> [--limit N] [--graph dot\|mermaid\|json]` | the task graph and the longest dependency chain through it: how many tasks and edges the capture carries, the chain's total executing time with every step's duration, thread and frame, the per-thread waiting spans, and (`--graph`) the graph itself for a viewer or a PR comment. Exit 2 when the capture carries no `TaskTrace` events, with the re-record line — never an empty path |
 | `bottleneck <capture> [--budget FPS \| --budget-ms MS] [--tid N] [--limit N]` | what bounds a frame: the **game thread**, the **render thread**, the **GPU**, or none of them. Every verdict is a measurement against the budget (the thread's own non-wait scope coverage, the sibling thread's coverage inside the same frame, the GPU's busy time when the capture carries the legacy GPU channel), with the evidence that decided it and the reasons it cannot decide. A capture with no GPU channel gets its CPU finding *plus* "the GPU side is unknown here", never a bare CPU-bound claim. Exit 0 classified / 2 nothing to judge (no frame pairs, no cycle frequency, no scopes) |
 | `parallelism <capture> [--budget FPS \| --budget-ms MS] [--tid N] [--limit N]` | was the work spread? Per thread: busy / waiting / lock-named cycles inside the frame series' own frames, the frame thread's **solo** work (measured overlap, not a dependency claim), the most threads working at once, lock overlap and the timers that own a quarter of the frames the model keeps — every ceiling Amdahl on a measure and labelled a heuristic, every absence (no core count, a lock nobody named) said out loud. Exit 0 reported / 2 nothing to measure (no frames, no cycle frequency, no scopes) |
+| `sources <capture> [--engine-dir DIR] [--filter TEXT] [--limit N]` | where the timers live: the trace's own file:line per spec, classified into engine vs project (source, engine plugin, project plugin) and module **by the shape of the path** — the recorded paths belong to the machine that recorded it — weighted by the work the model keeps for the longest frames, and cross-referenced with the engine's anti-pattern names (`tick`, `sync-load`, `object-churn`, `gc`, `serialize`, `wait`). `--engine-dir` is optional and only *checks* how many of those paths exist in the tree at hand. Exit 0 reported / 2 nothing to map (no specs, or none with a file:line) |
 | `summary <capture> [--budget FPS \| --budget-ms MS] [--tid N] [--limit N]` | is this capture fast? The frame-time **distribution** (mean/min/p50/p95/p99/max + a histogram) against an explicit budget (60 FPS by default) with a verdict, a **hitch count**, the one-line bottleneck verdict above, and the frames that break the budget — worst first, each naming the timers that ran in it. Exit 0 reported / 2 nothing to time (no frame pairs, or no cycle frequency) — being over budget is the report, not a failure |
 | `verify <capture> [--jobs N]` | walks everything and reports what does not add up: packet and stream anomalies, schema redefinitions, serial gaps, unpaired frames, unknown bookmark points. **Exit 1** when anything error-level was found |
 | `parse <capture> [--jobs N]` | builds (and caches) the session model; prints what it holds |
@@ -169,10 +170,9 @@ by the commands that print it. `--jobs N` sets how many processes that walk may 
 that has to build the model — and `--jobs 0` (the default) chooses for the machine. It cannot change
 a byte of the output; the suite pins serial ≡ parallel.
 
-Planned (see `ROADMAP.md`): the timer **call tree** and self time, source mapping, a `coverage`
-command that says whether a capture can answer a question at all, GPU / memory / loading /
-stats-channel analyses, the recommendations engine, and `compare` as a CI gate with p99 thresholds
-and rolling baselines.
+Planned (see `ROADMAP.md`): the timer **call tree** and self time, a `coverage` command that says
+whether a capture can answer a question at all, GPU / memory / loading / stats-channel analyses, the
+recommendations engine, and `compare` as a CI gate with p99 thresholds and rolling baselines.
 
 Output philosophy for those: every report carries a `meta` block (tool version, input hashes,
 engine and protocol version detected, engine-dir path as configured, analysis duration,
