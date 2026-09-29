@@ -11,10 +11,24 @@ Any change to `src/py/` or `tests/` is not finished until all three pass:
 
 ```powershell
 python src\py\ueia.py lz4 --build       # step 0: bin/ueia_lz4.dll, built only when stale
-python src\py\ueia.py selftest          # the hermetic suite: ~160 s (the corpus half dominates), exit 0 pass / 1 fail / 2 bad option
-npx --yes pyright@latest                # must print: 0 errors, 0 warnings
+python src\py\ueia.py selftest          # ~45 s, 517 tests, exit 0 pass / 1 fail / 2 bad option
+npx --yes --offline pyright@1.1.414     # ~13 s; must print: 0 errors, 0 warnings
 python src\py\ueia.py goldens --check   # the corpus: exit 0 matched / 1 a problem / 2 nothing to compare
 ```
+
+**Two things these commands must not do, both measured 2026-09-29** (the gates took *minutes*, which
+is a bug in the gates, not a fact of life):
+
+* **`pyright@latest` costs ~40 s of registry resolution on every run** (51 s measured, against 13 s
+  for the same check with a pinned, cached version and `--offline`; pyright's own work is ~10 s). Pin
+  the version and keep `--offline`; if the pinned version is not cached yet, run it once without
+  `--offline` to fetch it.
+* **A test class that reads a registered capture must set `use_cache = True`** (`testcase.UeiaTestCase`
+  documents it). With the cache off, every corpus test re-parsed its capture: `test_compare` alone
+  parsed the editor capture four times (72 s) and the whole suite was **~4-5 minutes**. With the
+  cache allowed for the corpus classes it is **~45 s**, and it cannot change an answer -- the cache
+  is keyed by the capture's SHA-256 and the tool version. Hermetic tests keep it off, because a
+  test must never pass on an answer a previous run left on disk.
 
 Step 0 is the decoder's build, and it is part of the pipeline rather than advice: `lz4 --build`
 hashes the recipe (both LZ4 sources and `CMakeLists.txt`, so a flag change counts) against the

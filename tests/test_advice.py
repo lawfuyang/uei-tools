@@ -32,6 +32,9 @@ BUDGET = summary.parse_budget("60", None)
 
 class TestTheRules(UeiaTestCase):
     """`build` over the fixture: which rules fire, and in what order."""
+    #: This class reads a registered capture: the cache beside it is content-keyed.
+    use_cache = True
+
 
     def _context(self, data: "bytes | None" = None, explicit: bool = False) -> advice.Context:
         import commands
@@ -173,6 +176,9 @@ class TestTheCommand(UeiaTestCase):
 
 class TestTheRealCaptures(UeiaTestCase):
     """The registered captures: what they recommend, and the rule that must not fire."""
+    #: This class reads a registered capture: the cache beside it is content-keyed.
+    use_cache = True
+
 
     @classmethod
     def setUpClass(cls) -> None:

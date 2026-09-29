@@ -391,6 +391,9 @@ def _frame(uid: int, cycle: int, serial: int) -> bytes:
 
 class TestTheRealCaptures(UeiaTestCase):
     """The registered captures: what only a real `.utrace` says about where its timers live."""
+    #: This class reads a registered capture: the cache beside it is content-keyed.
+    use_cache = True
+
 
     def _tree(self) -> "engine.EngineDir | None":
         """The engine tree this machine names, if it names one: `$UEI_ENGINE_DIR`, never a literal.

@@ -191,6 +191,7 @@ def cmd_goldens(args: List[str]) -> int:
     write = False
     verbose = False
     only: Optional[str] = None
+    commands: Optional[List[str]] = None
     index = 0
     while index < len(args):
         arg = args[index]
@@ -205,6 +206,20 @@ def cmd_goldens(args: List[str]) -> int:
             if index >= len(args):
                 raise UeiaError("--capture needs a key")
             only = args[index]
+        elif arg == "--only":
+            # a command filter, for iterating on one transcript and for the suite's own harness
+            # tests: re-running all thirteen commands as subprocesses is ~4 s per capture, and a
+            # test about *the harness* does not need to pay it three times over.
+            index += 1
+            if index >= len(args):
+                raise UeiaError("--only needs a command name, or a comma-separated list")
+            wanted = [name.strip() for name in args[index].split(",") if name.strip()]
+            known = [name for name, _argv in PINNED_COMMANDS]
+            unknown = [name for name in wanted if name not in known]
+            if unknown:
+                raise UeiaError("no such pinned command: %s (have %s)"
+                                % (", ".join(unknown), ", ".join(known)))
+            commands = wanted
         else:
             raise UeiaError("unknown goldens option %r" % (arg,))
         index += 1
@@ -231,7 +246,9 @@ def cmd_goldens(args: List[str]) -> int:
         if verbose:
             sys.stdout.write("comparing %s\n" % (key,))
         transcript_dir = TRANSCRIPTS_DIR / key
-        for name, argv in PINNED_COMMANDS:
+        chosen = [(name, argv) for name, argv in PINNED_COMMANDS
+                  if commands is None or name in commands]
+        for name, argv in chosen:
             text = _transcript(capture, name, argv)
             path = transcript_dir / (name + ".txt")
             if write:
@@ -260,7 +277,9 @@ def cmd_goldens(args: List[str]) -> int:
     if problems:
         sys.stdout.write("%d problem(s) over %d capture(s)\n" % (len(problems), compared))
         return 1
-    sys.stdout.write("%d capture(s) compared and matched\n" % (compared,))
+    sys.stdout.write("%d capture(s) compared and matched%s\n" % (
+        compared, "" if commands is None else " (%d of %d commands: %s)"
+        % (len(commands), len(PINNED_COMMANDS), ", ".join(commands))))
     return 0
 
 

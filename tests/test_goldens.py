@@ -78,6 +78,9 @@ class TestLabelFacts(UeiaTestCase):
 
 class TestHarness(UeiaTestCase):
     """The whole harness against a scratch corpus shaped like the real one."""
+    #: This class reads a registered capture: the cache beside it is content-keyed.
+    use_cache = True
+
 
     def setUp(self) -> None:
         super().setUp()
@@ -123,19 +126,39 @@ class TestHarness(UeiaTestCase):
         self.assertIn("not present", out)
         self.assertIn("nothing to compare", out)
 
+    #: Two commands are enough to prove write/check/tamper and cost seconds rather than a minute:
+    #: every pinned command is a real CLI subprocess (~0.3 s each), and `test_transcripts_carry_no
+    #: _paths` still runs the *whole* pinned set once, so nothing here goes unexercised.
+    FEW = ["--only", "info,verify"]
+
     def test_write_then_check_then_tamper(self) -> None:
         self._write_corpus()
-        code, out, _err = self.run_cli(["goldens", "--write"])
+        code, out, _err = self.run_cli(["goldens", "--write"] + self.FEW)
         self.assertEqual(code, 0, out)
         transcripts = sorted(self.transcripts_dir.joinpath(KEY).glob("*.txt"))
-        self.assertEqual(len(transcripts), len(goldens.PINNED_COMMANDS))
-        code, out, _err = self.run_cli(["goldens", "--check"])
+        self.assertEqual(len(transcripts), 2, "one transcript per selected command")
+        code, out, _err = self.run_cli(["goldens", "--check"] + self.FEW)
         self.assertEqual(code, 0, out)
         self.assertIn("compared and matched", out)
+        self.assertIn("(2 of %d commands: info, verify)" % (len(goldens.PINNED_COMMANDS),), out)
         transcripts[0].write_text("# exit=0\nnot what the tool says\n", encoding="utf-8")
-        code, out, _err = self.run_cli(["goldens", "--check"])
+        code, out, _err = self.run_cli(["goldens", "--check"] + self.FEW)
         self.assertEqual(code, 1)
         self.assertIn("differs", out)
+
+    def test_a_filter_names_commands_and_refuses_strangers(self) -> None:
+        """`--only` is by command name, and an unknown one is refused, not silently ignored.
+
+        Exit 1 rather than 2: this command's own option errors are `UeiaError`s, which the CLI
+        reports as failures (`--capture` on an unknown key behaves the same way).
+        """
+        self._write_corpus()
+        code, out, _err = self.run_cli(["goldens", "--check", "--only", "verify"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("(1 of %d commands: verify)" % (len(goldens.PINNED_COMMANDS),), out)
+        code, _out, err = self.run_cli(["goldens", "--check", "--only", "nope"])
+        self.assertEqual(code, 1)
+        self.assertIn("no such pinned command", err)
 
     def test_transcripts_carry_no_paths(self) -> None:
         capture = self._write_corpus()
@@ -157,8 +180,8 @@ class TestHarness(UeiaTestCase):
             json.dumps({"capture": {"sha256": identity["sha256"]}, "facts": {"packets": 9999}}),
             encoding="utf-8",
         )
-        self.run_cli(["goldens", "--write"])
-        code, out, _err = self.run_cli(["goldens", "--check"])
+        self.run_cli(["goldens", "--write"] + self.FEW)
+        code, out, _err = self.run_cli(["goldens", "--check"] + self.FEW)
         self.assertEqual(code, 1)
         self.assertIn("label packets says 9999", out)
 
@@ -167,8 +190,8 @@ class TestHarness(UeiaTestCase):
         self.labels_dir.joinpath(KEY + ".json").write_text(
             json.dumps({"capture": {"sha256": "AB" * 32}, "facts": {}}), encoding="utf-8"
         )
-        self.run_cli(["goldens", "--write"])
-        code, out, _err = self.run_cli(["goldens", "--check"])
+        self.run_cli(["goldens", "--write", "--only", "info"])
+        code, out, _err = self.run_cli(["goldens", "--check", "--only", "info"])
         self.assertEqual(code, 1)
         self.assertIn("not the labelled capture", out)
 

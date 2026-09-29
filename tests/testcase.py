@@ -29,15 +29,28 @@ import shapes  # noqa: E402  (after the path setup, on purpose)
 
 
 class UeiaTestCase(unittest.TestCase):
-    """A scratch directory, no cache, and one way to run the CLI."""
+    """A scratch directory, no cache, and one way to run the CLI.
+
+    **The cache is off by default**, because a hermetic test must not be able to pass on an answer a
+    previous run left on disk. A test class that reads a **registered capture** sets `use_cache`, and
+    that is safe for the reason the cache exists at all: it is keyed by the capture's SHA-256 *and*
+    the tool version, so it can only skip work, never change a number -- and parsing the corpus
+    afresh per test is what made the suite take minutes (`compare` alone parsed the editor capture
+    four times, 70 s). Measured 2026-09-29: those classes went from 32-72 s to a few seconds.
+    """
+
+    #: Corpus tests only: allow the parse cache beside the registered captures.
+    use_cache = False
 
     def setUp(self) -> None:
         self._scratch = tempfile.TemporaryDirectory(prefix="ueia-test-")
         self.addCleanup(self._scratch.cleanup)
         self.dir = Path(self._scratch.name)
-        self._env_patch = _EnvPatch({shapes.ENV_NO_CACHE: "1"})
-        self._env_patch.start()
-        self.addCleanup(self._env_patch.stop)
+        self._env_patch: Optional[_EnvPatch] = None
+        if not self.use_cache:
+            self._env_patch = _EnvPatch({shapes.ENV_NO_CACHE: "1"})
+            self._env_patch.start()
+            self.addCleanup(self._env_patch.stop)
 
     def write_capture(self, data: bytes, name: str = "fixture.utrace") -> Path:
         """Write fixture bytes into the scratch directory."""

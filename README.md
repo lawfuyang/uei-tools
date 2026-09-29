@@ -158,8 +158,8 @@ three). Commands that need engine-provided tooling will take `--engine-dir` (or 
 | `cache <capture> [--clear]` | the parse cache beside a capture: status, or remove it |
 | `csv <subcommand> ...` | the engine's CSV toolbox, wrapped (§2): `info` (a CSV's shape and numbers, `--json FILE` for the machine form), `split`, `convert`, `filter`, `collate`, `svg`, `report`, `regressions`, and `from-trace` — synthesize the CSV Profiler `.csv` from a capture's own CSV events, the bridge no engine exe offers. `--engine-dir DIR` or `$UEI_ENGINE_DIR`; exit **2** when there is no engine tree, never a silent pass |
 | `lz4 [--build] [--force]` | the LZ4 decoder: which library answered, its version, whether it matches the recipe that built it, and a decode of a known block as proof it works. `--build` compiles `bin/ueia_lz4.dll` when it is missing or stale (`--force` rebuilds either way). Exit 0 usable and current / 1 stale or broken / 2 nothing to decode with |
-| `selftest [-v] [-k PATTERN]` | the hermetic unit-test suite — no capture, no engine directory, no network. Exit 0 pass / 1 fail / 2 bad option |
-| `goldens [--check\|--write] [--capture KEY] [-v]` | the corpus: re-runs the pinned commands over the captures this machine has and compares. Exit 0 matched / 1 a problem / 2 nothing to compare |
+| `selftest [-v] [-k PATTERN]` | the hermetic unit-test suite — no capture, no engine directory, no network; ~45 s over 517 tests. Exit 0 pass / 1 fail / 2 bad option |
+| `goldens [--check\|--write] [--capture KEY] [--only CMD[,CMD]] [-v]` | the corpus: re-runs the pinned commands over the captures this machine has and compares. `--capture` limits it to one capture, `--only` to named commands (iterating on one transcript, and the suite's own harness tests). Exit 0 matched / 1 a problem / 2 nothing to compare |
 
 The parse cache sits beside the capture, keyed by its SHA-256 and the tool version, and never
 changes an answer — only the seconds a command takes: measured on the corpus (2026-09-29), a cold
