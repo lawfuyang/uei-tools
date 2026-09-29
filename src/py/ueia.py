@@ -4,8 +4,8 @@ Usage:
   python src\\py\\ueia.py <command> <capture.utrace> [args...]
   python src\\py\\ueia.py csv <subcommand> [args...] [--engine-dir DIR]
   python src\\py\\ueia.py lz4 [--build] [--force]
-  python src\\py\\ueia.py selftest [-v] [-k PATTERN]
-  python src\\py\\ueia.py goldens [--check|--write] [--capture KEY] [-v]
+  python src\\py\\ueia.py selftest [-v] [-k PATTERN] [--quick]
+  python src\\py\\ueia.py goldens [--check|--write] [--capture KEY] [--only CMD[,CMD]] [-v]
 
 Commands:
   info <capture>              the file's own account of itself, and its packet layer
@@ -87,12 +87,18 @@ Commands:
                               to decode with). `--build` is the pipeline's first step
                               and does nothing when there is nothing to do
 
-  selftest [-v] [-k PATTERN]  the hermetic unit-test suite (exit 0 pass, 1 fail,
-                              2 bad option): no capture, no engine, no network
-  goldens [--check|--write] [--capture KEY] [-v]
-                              the corpus: re-run the pinned commands over the
-                              captures this machine has and compare (exit 2 when
-                              there is nothing to compare)
+  selftest [-v] [-k PATTERN] [--quick]
+                             the hermetic unit-test suite (exit 0 pass, 1 fail,
+                             2 bad option): no capture, no engine, no network.
+                             --quick leaves out the classes that read the
+                             registered captures -- ~500 tests in a few seconds
+                             instead of ~530 in half a minute -- and says how
+                             many it left out
+  goldens [--check|--write] [--capture KEY] [--only CMD[,CMD]] [-v]
+                             the corpus: re-run the pinned commands over the
+                             captures this machine has and compare -- all of them,
+                             or only the named ones (exit 2 when there is nothing
+                             to compare)
 
 Row commands take --format table|csv|markdown (table is the default; in the
 non-table forms stdout is the table alone and the prose moves to stderr) and

@@ -1963,19 +1963,28 @@ def _flatten(suite: unittest.TestSuite) -> List[unittest.TestCase]:
 
 
 def cmd_selftest(args: List[str]) -> int:
-    """`selftest [-v] [-k PATTERN]`: the hermetic unit-test suite.
+    """`selftest [-v] [-k PATTERN] [--quick]`: the hermetic unit-test suite.
 
     Exit codes: 0 every test passed, 1 a failure, 2 a bad option or an empty
     selection. Hermetic means no capture, no engine directory and no network:
     the fixtures are built in memory by the tests themselves.
+
+    `--quick` leaves out the classes marked `corpus` (`testcase.UeiaTestCase`): they read the
+    registered captures, and that is where all of this suite's seconds are -- a real decode per
+    capture, a real CLI subprocess per pinned command. Measured 2026-09-29: 528 tests in 35 s, of
+    which ~25 s is corpus work; `--quick` runs the other ~500 in a few seconds and **says how many
+    it left out**, because a suite that quietly checks less is worse than a slow one.
     """
     verbose = False
+    quick = False
     pattern: Optional[str] = None
     index = 0
     while index < len(args):
         arg = args[index]
         if arg in ("-v", "--verbose"):
             verbose = True
+        elif arg == "--quick":
+            quick = True
         elif arg == "-k":
             index += 1
             if index >= len(args):
@@ -1999,12 +2008,30 @@ def cmd_selftest(args: List[str]) -> int:
     if pattern is not None:
         needle = pattern.lower()
         tests = [test for test in tests if needle in test.id().lower()]
+    left_out = 0
+    if quick:
+        tests, left_out = _without_corpus(tests)
     if not tests:
         sys.stdout.write("no test matched %r\n" % (pattern,))
         return 2
+    if quick:
+        sys.stdout.write(
+            "%d corpus test(s) left out (--quick): they read the registered captures, which is "
+            "where this suite's seconds are. Run `selftest` for those.\n" % (left_out,)
+        )
     runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2 if verbose else 1)
     result = runner.run(unittest.TestSuite(tests))
     return 0 if result.wasSuccessful() else 1
+
+
+def _without_corpus(tests: Sequence[unittest.TestCase]) -> Tuple[List[unittest.TestCase], int]:
+    """`(tests that do not read a registered capture, how many were left out)`.
+
+    Read from the test's own class (`testcase.UeiaTestCase.corpus`), so the marker lives with the
+    class that knows it is one -- and a test class that forgets it is *run*, never silently skipped.
+    """
+    kept = [test for test in tests if not getattr(test.__class__, "corpus", False)]
+    return kept, len(tests) - len(kept)
 
 
 __all__ = [

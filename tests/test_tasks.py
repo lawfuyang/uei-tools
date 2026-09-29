@@ -542,7 +542,7 @@ class TestTheFixtureThroughTheWalk(UeiaTestCase):
 class TestTheRealCaptures(UeiaTestCase):
     """Every registered capture, and the honest answer each one gets: no task events, exit 2."""
     #: This class reads a registered capture: the cache beside it is content-keyed.
-    use_cache = True
+    corpus = True
 
 
     @classmethod

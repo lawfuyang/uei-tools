@@ -32,22 +32,24 @@ class UeiaTestCase(unittest.TestCase):
     """A scratch directory, no cache, and one way to run the CLI.
 
     **The cache is off by default**, because a hermetic test must not be able to pass on an answer a
-    previous run left on disk. A test class that reads a **registered capture** sets `use_cache`, and
+    previous run left on disk. A test class that reads a **registered capture** sets `corpus`, and
     that is safe for the reason the cache exists at all: it is keyed by the capture's SHA-256 *and*
     the tool version, so it can only skip work, never change a number -- and parsing the corpus
     afresh per test is what made the suite take minutes (`compare` alone parsed the editor capture
     four times, 70 s). Measured 2026-09-29: those classes went from 32-72 s to a few seconds.
     """
 
-    #: Corpus tests only: allow the parse cache beside the registered captures.
-    use_cache = False
+    #: Corpus tests set this: they read the registered captures themselves. It is what allows the
+    #: parse cache beside them (content-keyed, so it can only skip work) and what `selftest --quick`
+    #: uses to leave them out of the inner loop.
+    corpus = False
 
     def setUp(self) -> None:
         self._scratch = tempfile.TemporaryDirectory(prefix="ueia-test-")
         self.addCleanup(self._scratch.cleanup)
         self.dir = Path(self._scratch.name)
         values = {shapes.ENV_NO_ENGINE_SCAN: "1"}
-        if not self.use_cache:
+        if not self.corpus:
             values[shapes.ENV_NO_CACHE] = "1"
         self._env_patch = _EnvPatch(values)
         self._env_patch.start()

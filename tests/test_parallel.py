@@ -262,7 +262,7 @@ class TestTheRealCaptures(UeiaTestCase):
     Skipped, loudly, when this machine has none of them -- a skip is a skip, never a pass.
     """
     #: This class reads a registered capture: the cache beside it is content-keyed.
-    use_cache = True
+    corpus = True
 
 
     @classmethod

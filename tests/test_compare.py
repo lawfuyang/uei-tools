@@ -166,7 +166,7 @@ class TestTheCommand(UeiaTestCase):
 class TestTheRealCapture(UeiaTestCase):
     """The corpus: the self-diff the item asks for by name, over a real capture's metrics."""
     #: This class reads a registered capture: the cache beside it is content-keyed.
-    use_cache = True
+    corpus = True
 
 
     def test_the_editor_capture_against_itself_is_empty(self) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from typing import List
 from unittest import mock
 
 from testcase import UeiaTestCase
@@ -259,6 +260,43 @@ class TestSelftestCommand(UeiaTestCase):
         code, _out, err = self.run_cli(["selftest", "-k"])
         self.assertEqual(code, 2)
         self.assertIn("-k needs a pattern", err)
+
+
+class TestTheQuickSelection(UeiaTestCase):
+    """`selftest --quick`: which tests it leaves out, and that it never guesses quietly.
+
+    The selection is read from the test's own class (`testcase.UeiaTestCase.corpus`), so the marker
+    lives beside the class that reads a capture. A class that *forgets* the marker is run -- the
+    failure mode to avoid is a test that stops being exercised without anyone noticing.
+    """
+
+    def _tests(self) -> List[unittest.TestCase]:
+        class Plain(unittest.TestCase):
+            def test_plain(self) -> None:
+                pass
+
+        class Real(UeiaTestCase):
+            corpus = True
+
+            def test_real(self) -> None:
+                pass
+
+        return [Plain("test_plain"), Real("test_real")]
+
+    def test_it_keeps_the_hermetic_tests_and_counts_the_corpus_ones(self) -> None:
+        kept, left_out = commands._without_corpus(self._tests())
+        self.assertEqual(len(kept), 1)
+        self.assertIn("test_plain", kept[0].id(), "the marked class is the only one left out")
+        self.assertEqual(left_out, 1)
+
+    def test_nothing_to_leave_out_is_not_an_error(self) -> None:
+        class Plain(unittest.TestCase):
+            def test_only(self) -> None:
+                pass
+
+        kept, left_out = commands._without_corpus([Plain("test_only")])
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(left_out, 0)
 
 
 if __name__ == "__main__":

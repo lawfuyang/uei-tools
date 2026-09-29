@@ -11,10 +11,14 @@ Any change to `src/py/` or `tests/` is not finished until all three pass:
 
 ```powershell
 python src\py\ueia.py lz4 --build       # step 0: bin/ueia_lz4.dll, built only when stale
-python src\py\ueia.py selftest          # ~45 s, 517 tests, exit 0 pass / 1 fail / 2 bad option
+python src\py\ueia.py selftest          # 530 tests, ~30 s, exit 0 pass / 1 fail / 2 bad option
 npx --yes --offline pyright@1.1.414     # ~13 s; must print: 0 errors, 0 warnings
 python src\py\ueia.py goldens --check   # the corpus: exit 0 matched / 1 a problem / 2 nothing to compare
 ```
+
+**While iterating, `selftest --quick` is the inner loop**: it leaves out the 42 tests whose classes
+are marked `corpus` (they read the registered captures, and they are ~25 s of the ~30), says how many
+it left out, and runs the other 488 in about six seconds. The gate is still the full suite.
 
 **Two things these commands must not do, both measured 2026-09-29** (the gates took *minutes*, which
 is a bug in the gates, not a fact of life):
@@ -23,7 +27,7 @@ is a bug in the gates, not a fact of life):
   for the same check with a pinned, cached version and `--offline`; pyright's own work is ~10 s). Pin
   the version and keep `--offline`; if the pinned version is not cached yet, run it once without
   `--offline` to fetch it.
-* **A test class that reads a registered capture must set `use_cache = True`** (`testcase.UeiaTestCase`
+* **A test class that reads a registered capture must set `corpus = True`** (`testcase.UeiaTestCase`
   documents it). With the cache off, every corpus test re-parsed its capture: `test_compare` alone
   parsed the editor capture four times (72 s) and the whole suite was **~4-5 minutes**. With the
   cache allowed for the corpus classes it is **~45 s**, and it cannot change an answer -- the cache

@@ -141,7 +141,7 @@ class TestTheFixtureTree(UeiaTestCase):
 class TestTheRealCapture(UeiaTestCase):
     """The corpus: a real frame's tree, where the numbers are nobody's to choose."""
     #: This class reads a registered capture: the cache beside it is content-keyed.
-    use_cache = True
+    corpus = True
 
 
     @classmethod

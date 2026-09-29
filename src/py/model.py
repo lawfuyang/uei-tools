@@ -16,6 +16,7 @@ whatever could not be decoded is counted rather than guessed at.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict
@@ -931,6 +932,7 @@ def _parallel_shares(
     """
     if not units:
         return []
+    before = {child.pid for child in multiprocessing.active_children()}
     pool = ProcessPoolExecutor(
         max_workers=workers,
         initializer=_worker_init,
@@ -954,6 +956,19 @@ def _parallel_shares(
         for pending in futures:
             pending.cancel()
         pool.shutdown(wait=False)
+        # ... and the executor's own `atexit` handler joins its workers, so a worker that never
+        # comes back -- a stall, a death, or work it never received -- keeps the *interpreter* alive
+        # for as long as it survives. Measured 2026-09-29: six pool tests cost 1.39 s of test time
+        # and 7.3 s of wall time, all of the difference spent after the tests, joining workers.
+        # Only this pool's own children are terminated, by pid, and only after every result this
+        # call was going to get has been collected (or its unit has failed) -- so nothing is cut
+        # short that the caller was still waiting for.
+        for child in multiprocessing.active_children():
+            if child.pid not in before:
+                child.terminate()
+        for child in multiprocessing.active_children():
+            if child.pid not in before:
+                child.join(timeout=1.0)
 
 
 def _workers_for(units: List[Tuple[int, bytes]], jobs: int) -> int:

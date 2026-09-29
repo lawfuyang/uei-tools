@@ -88,7 +88,7 @@ class TestLabelFacts(UeiaTestCase):
 class TestHarness(UeiaTestCase):
     """The whole harness against a scratch corpus shaped like the real one."""
     #: This class reads a registered capture: the cache beside it is content-keyed.
-    use_cache = True
+    corpus = True
 
 
     def setUp(self) -> None:
@@ -211,12 +211,18 @@ class TestHarness(UeiaTestCase):
         self.assertIn("no such capture key", err)
 
     def test_check_limits_to_one_capture(self) -> None:
+        """The subject is the *capture* filter, so one pinned command is the whole of the work.
+
+        This test ran the full twelve-command set twice and cost 8.75 s -- the single slowest test
+        in the suite, for a question about `--capture` (measured 2026-09-29, per-test profile). Which
+        commands run is not what it asks.
+        """
         self._write_corpus()
         self.captures_file.write_text(
             json.dumps({KEY: {}, "other": {}}), encoding="utf-8"
         )
-        self.run_cli(["goldens", "--write", "--capture", KEY])
-        code, out, _err = self.run_cli(["goldens", "--check", "--capture", KEY])
+        self.run_cli(["goldens", "--write", "--capture", KEY, "--only", "info"])
+        code, out, _err = self.run_cli(["goldens", "--check", "--capture", KEY, "--only", "info"])
         self.assertEqual(code, 0, out)
         self.assertNotIn("other", out)
 
