@@ -161,42 +161,74 @@ specs, 27,760 timer specs (4,879 with file:line), 182 counter specs, session dur
 `verify` reports 0 errors and 0 warnings. These are the numbers the parser's golden output must
 reproduce (`goldens/labels/editor-pie-1.json` pins them).
 
-Cost, measured in this working tree on this machine (2026-09-28, a cold `parse`, frame work
+Cost, measured in this working tree on this machine (2026-09-29, a cold `parse`, frame work
 attribution, occupancy and the GPU frame decode included — §10, §11):
 
 | phase | serial | `--jobs 0` (the pool) |
 |---|---|---|
-| read the 34 MB file | 0.008 | 0.007 |
+| read the 34 MB file | 0.008 | 0.011 |
 | container header | 0.000 | 0.000 |
-| packets (163,600 headers) | 0.259 | 0.247 |
-| streams (LZ4: 24,767 blocks, 34.8 MB → 49.9 MB) | 0.617 | 0.609 |
-| model (the per-thread Python walk, all of the above) | 13.257 | 5.804 |
-| **cold full decode** | **14.07** | **6.98** |
+| packets (163,600 headers) | 0.250 | 0.254 |
+| streams (LZ4: 24,767 blocks, 34.8 MB → 49.9 MB) | 0.651 | 0.671 |
+| model (the per-thread Python walk, all of the above) | 11.485 | 4.752 |
+| **cold full decode** | **12.39** | **5.69** |
 
-A cached command is **0.52 s** (`summary` and `bottleneck` included: everything they report is in
-the cache, never re-derived from the streams) and `goldens --check` ~20 s over the three registered
-captures, whose transcripts are the pinned commands' real output.
+A cached command is **0.23-0.29 s** (`summary` and `bottleneck` included: everything they report is
+in the cache, never re-derived from the streams) and `goldens --check` ~20 s over the three
+registered captures, whose transcripts are the pinned commands' real output. What a warm command
+spends its time on, measured 2026-09-29: **0.17 s interpreter and imports** (nothing this tool can
+avoid), **0.03 s** hashing the capture and **0.02 s** parsing the 3.35 MB cache, and -- before the
+lazy packet walk below -- **0.25 s walking 163,600 packet headers on every command**, including the
+seven that never look at the table. That is why `CaptureView.packets` is a property: `info`,
+`packets`, `schema` and `verify` walk it, the model-based commands never pay for it.
 
 Three histories are in that table. The LZ4 half is the C library (§2): with the pure-Python decoder
 the same cold decode was **21.3 s**. The walk is per-thread work, so `--jobs` spreads it over
-processes — measured **13.26 / 5.80 s** at 1 and 0 workers, and **9.56 / 5.41 / 4.14 / 4.16 /
-4.15 s** before the attribution landed. It stops at the *biggest* thread rather than at the core
-count: tid 2 owns 53.4% of the corpus's 10,055,971 batch records, so the ceiling is that one
-thread, and `--jobs 0` (the default) caps its own choice at 8 workers — past that nothing improves
-here, while a capture whose work is spread evenly gets more of the box. The answer does not depend
-on `--jobs` at all: shares are merged by one function in ascending tid order, byte-for-byte into
-the cache's own format.
+processes — measured 2026-09-29 on the same capture: **12.99 / 7.54 / 5.99 / 6.00 / 5.99 / 6.04 /
+6.02 / 6.10 s** at 1 / 2 / 4 / 6 / 8 / 10 / 12 / 16 workers. It stops at the *biggest* thread rather
+than at the core count: tid 2 owns 53.4% of the corpus's 10,055,971 batch records, so the ceiling is
+that one thread and the curve is flat from 4 workers on (8 workers was 4.14 s before the occupancy
+landed, on the same shape of curve). `--jobs 0` (the default) caps its own choice at 8, while a
+capture whose work is spread evenly gets more of the box. The answer does not depend on `--jobs` at
+all: shares are merged by one function in ascending tid order, byte-for-byte into the cache's own
+format.
 
 **What the attribution and occupancy cost.** Walking tid 2 alone — 5.49 M of those records, the
-biggest single unit — takes **4.09 s with nothing attributed and 5.18 s with the frame work and the
-occupancy (+27%)**, which is the ~1.1 s the pool shows on the critical thread; the cold total went
+biggest single unit — takes **3.28 s with nothing attributed and 4.24 s with the frame work and the
+occupancy (+29%)**, which is the ~1 s the pool shows on the critical thread; the cold total went
 5.97 s (work only, before the occupancy) → 6.98 s with everything. Two cheaper shapes were measured
 and rejected on the way: accumulating into a dict per frame (**+23%** against +19% for the locals)
 and writing every count into the walk's `counts` dict as it goes; the loop keeps its totals, its
-running coverage and its counters in locals and flushes them once per frame window. The cost is paid
-once per capture, by the parse that fills the cache; a warm `summary`/`bottleneck` is the same 0.52 s
-as any other cached command, which is the whole reason the occupancy lives in the model rather than
+running coverage and its counters in locals and flushes them once per frame window, and since
+2026-09-29 it also keeps the per-frame totals in a **list** (`totals[spec] += span`, an index
+instead of two hashes for 2.5 M pairs) and answers the **disjoint** coverage case first. The cost is
+paid once per capture, by the parse that fills the cache; a warm `summary`/`bottleneck` is 0.26/0.29 s
+like any other cached command, which is the whole reason the occupancy lives in the model rather than
 being recomputed by the report.
+
+**Where the remaining seconds are, and what was tried.** A profile of the serial parse (51.2 s under
+`cProfile`, ~3× real time) put `decode7bit` at the top with 15.08 M calls, then the walk's own loop,
+then `decode_batch` (837,357 batches, 10,055,971 records), then `iter_thread_events` (2.23 M events)
+and the aux framing. Five changes came out of it, all in the same week and all pinned by the corpus
+transcripts (which did *not* change):
+
+| change | why it was there |
+|---|---|
+| `decode7bit`'s one-byte fast path | the commonest varint by far is a 1-byte delta or spec id, and the function was the tool's hottest |
+| the varint fast path **inlined** into `decode_batch` | 15.08 M calls became ~1 M: the call overhead was half of what the decoder cost |
+| one memoised schema lookup per uid in `iter_thread_events` | it asked `size`, `has_aux` and `is_sync` per event: three method calls on 2.23 M events |
+| values decoded **only** for the event types the walk handles | ~1 M events were paying for a value dict and an aux walk the model has nothing to say about |
+| `CaptureView.packets` is a **property** | 0.25 s of packet walking on every command, including the seven that never look at the table |
+
+Measured on the corpus: a cold parse **6.93 → 5.69 s** (-18%), serial **15.2 → 12.4 s** (-18%), and
+the model-based warm commands **~0.50 → 0.23-0.29 s** (-45%). Three shapes were **measured and
+rejected** rather than assumed: threading the LZ4 decode (the per-block Python holds the GIL — 0.42 s
+serial against 1.00 s on 8 threads), a faster `packets --limit 0` (its 1.08 s is the 0.30 s walk and
+12.8 MB of text, not Python overhead), and a pickle cache (the JSON parse is 0.022 s, so it would have
+traded the plain-text cache's safety for nothing measurable). The lesson the changes cost: the
+coverage merge's "disjoint" shortcut first shipped **wrong** — it moved the region's left edge and
+double-counted later overlaps — and the corpus's own verdicts (`game-pc-2`: 770 bounded frames where
+9 are real) caught it inside one run, because the transcripts pin the answers and not just the code.
 
 ## 7. Where the format is defined (engine source tree)
 

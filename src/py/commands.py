@@ -20,7 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, cast
 
 import bottleneck
 import cache
@@ -199,18 +199,40 @@ def render_rows(
         sys.stdout.write("| " + " | ".join(cells) + " |\n")
 
 
-class CaptureView(NamedTuple):
-    """A capture read up to its packet layer (no LZ4, no model)."""
+class CaptureView(object):
+    """A capture read up to its packet layer: the bytes and header always, the walk on demand.
 
-    path: Path
-    data: bytes
-    header: ContainerHeader
-    packets: List[PacketRow]
-    packet_anomalies: List[Anomaly]
+    The walk is 163,600 packets of Python over the corpus (0.25 s, a quarter of every cold phase
+    table this tool prints) and every warm command used to pay for it whether or not it wanted the
+    table: `info`, `packets`, `schema` and `verify` do, while the model-based commands (`threads`,
+    `timers`, `frames`, `summary`, `bottleneck`, the `csv` bridge) never look at it at all. So it is
+    a property, walked once on first use -- which is half of a warm command's half-second.
+    """
+
+    def __init__(self, path: Path, data: bytes, header: ContainerHeader) -> None:
+        self.path = path
+        self.data = data
+        self.header = header
+        self._packets: Optional[List[PacketRow]] = None
+        self._packet_anomalies: List[Anomaly] = []
+
+    @property
+    def packets(self) -> List[PacketRow]:
+        if self._packets is None:
+            with timing.timed("packets"):
+                self._packets, self._packet_anomalies = container.walk_packets(
+                    self.data, self.header
+                )
+        return self._packets
+
+    @property
+    def packet_anomalies(self) -> List[Anomaly]:
+        self.packets  # the walk produces both, and neither is meaningful without it
+        return self._packet_anomalies
 
 
 def load_view(capture: str) -> CaptureView:
-    """Read the file, its container header and its packet walk."""
+    """Read the file and its container header; the packet walk happens when it is asked for."""
     path = Path(capture)
     with timing.timed("read"):
         try:
@@ -219,11 +241,7 @@ def load_view(capture: str) -> CaptureView:
             raise UeiaError("cannot read capture %s: %s" % (path.name, exc))
     with timing.timed("container"):
         header = container.parse_header(data)
-    with timing.timed("packets"):
-        packets, anomalies = container.walk_packets(data, header)
-    return CaptureView(
-        path=path, data=data, header=header, packets=packets, packet_anomalies=anomalies
-    )
+    return CaptureView(path=path, data=data, header=header)
 
 
 def _jobs(options: "Options") -> int:
@@ -245,8 +263,9 @@ def load_model(capture: str, jobs: int = 0) -> Tuple[CaptureView, SessionModel, 
     cached = cache.load(view.path, identity)
     if cached is not None:
         return view, cast(SessionModel, cached), True
+    packets = view.packets  # walked here, so its phase is "packets" and not "streams"
     with timing.timed("streams"):
-        stream_set = streams.assemble(view.data, view.packets)
+        stream_set = streams.assemble(view.data, packets)
     with timing.timed("model"):
         model, counts, _anomalies = build_model(stream_set, jobs)
     timing.progress(

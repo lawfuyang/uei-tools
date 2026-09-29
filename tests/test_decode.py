@@ -120,6 +120,21 @@ class TestDecodeBatch(UeiaTestCase):
         self.assertEqual(coroutine, 2)
         self.assertEqual(error, "")
 
+    def test_the_varint_reader_answers_the_one_byte_form(self) -> None:
+        """The hot path: 15.08 M calls on the corpus, most of them a single byte.
+
+        A one-byte varint is its own value, and the reader has to keep doing that for 0x00 and 0x7F
+        (the boundary before the continuation bit) as well as for the multi-byte form.
+        """
+        self.assertEqual(decode.decode7bit(b"\x00", 0), (0, 1))
+        self.assertEqual(decode.decode7bit(b"\x7f", 0), (127, 1))
+        self.assertEqual(decode.decode7bit(b"\x80\x01", 0), (128, 2))
+        self.assertEqual(decode.decode7bit(b"\xff\xff\x03", 0), (65535, 3))
+        with self.assertRaises(ValueError):
+            decode.decode7bit(b"\x80", 0)
+        with self.assertRaises(ValueError):
+            decode.decode7bit(b"", 0)
+
     def test_truncated_record_is_reported_but_keeps_earlier_ones(self) -> None:
         blob = _varint((100 << 2) | 1) + _varint(5) + b"\x80"
         records, _coroutine, error = decode.decode_batch(blob)

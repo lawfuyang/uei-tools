@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 from testcase import UeiaTestCase
 
 import cache
+import commands
+import container
 import shapes
 from fixtures import demo_trace
 
@@ -136,6 +139,50 @@ class TestRowCommands(UeiaTestCase):
         first_info = self.run_cli(["info", self.capture])
         second_info = self.run_cli(["info", self.capture])
         self.assertEqual(first_info, second_info)
+
+
+class TestTheLazyView(UeiaTestCase):
+    """`CaptureView.packets`: walked when it is asked for, once, and not by commands that never look.
+
+    The walk is 0.25 s over the corpus -- half of what a warm command used to spend -- and seven of
+    the commands never touch the table, so it is a property rather than a field of `load_view`.
+    """
+
+    def test_reading_the_view_does_not_walk_the_packets(self) -> None:
+        capture = self.write_capture(demo_trace())
+        with mock.patch.object(container, "walk_packets",
+                               wraps=container.walk_packets) as walk:
+            view = commands.load_view(str(capture))
+            self.assertEqual(walk.call_count, 0, "only reading the file and the header")
+            self.assertTrue(view.data)
+        with mock.patch.object(container, "walk_packets",
+                               wraps=container.walk_packets) as walk:
+            packets = view.packets
+            self.assertEqual(walk.call_count, 1)
+            self.assertTrue(packets)
+            self.assertIs(view.packets, packets, "and the answer is kept, not recomputed")
+            self.assertEqual(walk.call_count, 1)
+
+    def test_the_anomalies_come_from_the_same_walk(self) -> None:
+        capture = self.write_capture(demo_trace())
+        view = commands.load_view(str(capture))
+        self.assertEqual(view.packet_anomalies, [], "asking for them walks, and finds none")
+        self.assertEqual(view.packet_anomalies, [])
+
+    def test_a_cached_model_never_walks_the_packet_table(self) -> None:
+        """The point of the property: a warm command is answered from the cache, table untouched."""
+        capture = self.write_capture(demo_trace())
+        self.addCleanup(os.environ.__setitem__, shapes.ENV_NO_CACHE, "1")
+        os.environ.pop(shapes.ENV_NO_CACHE, None)   # this test wants the cache, unlike the others
+        with mock.patch.object(container, "walk_packets", wraps=container.walk_packets) as walk:
+            _view, first, cached_first = commands.load_model(str(capture))
+            self.assertFalse(cached_first)
+            walked_cold = walk.call_count
+            _view, second, cached_second = commands.load_model(str(capture))
+        self.assertEqual(second, first, "the same model, from the cache")
+        self.assertTrue(cached_second)
+        self.assertEqual(walk.call_count, walked_cold,
+                         "the second load did not walk the packets, the first had to")
 
 
 class TestVerifyAndParse(UeiaTestCase):

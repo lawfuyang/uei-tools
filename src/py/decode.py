@@ -134,28 +134,46 @@ def decode_batch(blob: bytes) -> Tuple[List[Tuple[int, Optional[int], bool]], in
     coroutine_records = 0
     offset = 0
     length = len(blob)
+    # The loop below runs once per record of every batch in a capture -- 10,055,971 times on the
+    # corpus -- and `decode7bit` was the single hottest function in the tool (15.08 M calls, 8.7 s of
+    # a profiled serial parse). Its one-byte form is the commonest by far (a delta, a spec id), so
+    # that case is decoded here, inline, without a call at all; anything longer falls through to it.
+    append = records.append
+    d7 = decode7bit
+    end_record = (0, None, False)
     while offset < length:
-        try:
-            packed, offset = decode7bit(blob, offset)
-        except ValueError as exc:
-            return records, coroutine_records, str(exc)
+        packed = blob[offset]
+        if packed < 0x80:
+            offset += 1
+        else:
+            try:
+                packed, offset = d7(blob, offset)
+            except ValueError as exc:
+                return records, coroutine_records, str(exc)
         is_begin = bool(packed & 1)
         if packed & 2:
             coroutine_records += 1
             try:
                 if is_begin:
-                    _coroutine_id, offset = decode7bit(blob, offset)
-                _depth, offset = decode7bit(blob, offset)
+                    _coroutine_id, offset = d7(blob, offset)
+                _depth, offset = d7(blob, offset)
             except ValueError as exc:
                 return records, coroutine_records, str(exc)
-            records.append((packed >> 2, None, is_begin))
+            append((packed >> 2, None, is_begin))
             continue
         if is_begin:
-            try:
-                spec_id, offset = decode7bit(blob, offset)
-            except ValueError as exc:
-                return records, coroutine_records, str(exc)
-            records.append((packed >> 2, spec_id, True))
+            if offset >= length:
+                return records, coroutine_records, "7-bit value runs past the end of its buffer"
+            spec_id = blob[offset]
+            if spec_id < 0x80:
+                offset += 1
+            else:
+                try:
+                    spec_id, offset = d7(blob, offset)
+                except ValueError as exc:
+                    return records, coroutine_records, str(exc)
+            append((packed >> 2, spec_id, True))
         else:
-            records.append((packed >> 2, None, False))
+            end_record = (packed >> 2, None, False)
+            append(end_record)
     return records, coroutine_records, ""

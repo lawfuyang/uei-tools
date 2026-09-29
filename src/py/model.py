@@ -57,6 +57,11 @@ WAIT_NAME_MARKERS = ("wait",)
 #: timer specs each of those rows names. Sixteen frames is more than any report lists (the summary's
 #: table caps at ten by default, and what it lists is the worst), and six timers is more than it
 #: prints (three), so the cache holds a little room around what is asked for -- and nothing else.
+#: The event names the walk decodes values for: everything else is counted (events, serials, uid
+#: counts) and skipped, which is what keeps a million events the model has nothing to say about from
+#: paying for a value dict each.
+_BATCH_EVENTS = frozenset(("CpuProfiler.EventBatchV2", "CpuProfiler.EventBatchV3"))
+
 _FRAME_WORK_KEEP = 16
 _FRAME_WORK_TOP = 6
 
@@ -286,15 +291,19 @@ class _Window(object):
         self.covered = 0
         self.waiting = 0
         self.pairs = 0
-        self.totals: Optional[Dict[int, int]] = None
+        # one slot per spec id: a list, not a dict, because the hot loop writes it once per scope
+        # pair (2.5 M of them on the corpus's game thread) and an index beats a hash there. Only a
+        # thread's longest frames have one at all.
+        self.totals: Optional[List[int]] = None
 
     def work_row(self, tid: int, top: int) -> FrameWorkRow:
         """This frame as the model keeps it: its biggest specs by clipped cycles, then by id."""
         items: List[Tuple[int, int]] = []
         totals = self.totals
         if totals:
-            ordered = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
-            items = [(int(spec), int(cycles)) for spec, cycles in ordered[:top]]
+            touched = [(cycles, spec) for spec, cycles in enumerate(totals) if cycles]
+            touched.sort(key=lambda item: (-item[0], item[1]))
+            items = [(spec, cycles) for cycles, spec in touched[:top]]
         return FrameWorkRow(
             tid=tid, type=self.type, begin_cycle=self.begin, end_cycle=self.end,
             cycles=self.end - self.begin, pairs=self.pairs, items=items,
@@ -412,7 +421,7 @@ def _walk_tid(
         for window in sorted(windows, key=lambda item: (
                 -(item.end - item.begin), item.begin, item.type))[:_FRAME_WORK_KEEP]:
             if window.end > window.begin:
-                window.totals = {}
+                window.totals = [0] * spec_count
     window_count = len(windows)
     last_cycle = 0
     stack: List[Tuple[Optional[int], int]] = []
@@ -451,10 +460,13 @@ def _walk_tid(
                 counts["serial_max"] = event.serial
         uid_key = str(event.uid)
         uid_counts[uid_key] = uid_counts.get(uid_key, 0) + 1
-        values = decode.event_values(row, stream, event)
+        # the name decides, and only then are the values decoded: `event_values` builds a dict and
+        # walks the aux blocks per event, which on the corpus is ~1 M events this walk has nothing
+        # to say about (it is what the "most of the profile" line was about)
         full_name = str(row["full_name"])
 
-        if full_name in ("CpuProfiler.EventBatchV2", "CpuProfiler.EventBatchV3"):
+        if full_name in _BATCH_EVENTS:
+            values = decode.event_values(row, stream, event)
             blob = values.get("Data")
             if not isinstance(blob, (bytes, bytearray)):
                 anomalies.append((
@@ -512,14 +524,20 @@ def _walk_tid(
                     spanning += 1
                 span = cycle - begin
                 if span > 0:
-                    # the streaming union, inlined because it runs once per scope pair: an interval
-                    # adds its prefix when it starts before the region and its tail when it ends
-                    # after it. The region is empty while `end < start`.
-                    if cover_end < cover_start:
+                    # the streaming union, inlined because it runs once per scope pair. The
+                    # commonest shape by far is the *disjoint* one -- the next scope starts where the
+                    # last one ended or later (`RenderingFrame`, then the work inside it) -- so that
+                    # case is tested first and answered without touching the general arithmetic. An
+                    # interval otherwise adds its prefix when it starts before the region and its
+                    # tail when it ends after it; the region is empty while `end < start`.
+                    if cover_end < cover_start:      # nothing covered yet in this window
                         covered = span
                         cover_start = begin
                         cover_end = cycle
-                    else:
+                    elif begin >= cover_end:         # the commonest shape: disjoint, to the right
+                        covered += span
+                        cover_end = cycle            # the left edge of the region does not move
+                    else:                            # overlapping, or containing the region
                         if begin < cover_start:
                             covered += cover_start - begin
                             cover_start = begin
@@ -545,12 +563,13 @@ def _walk_tid(
                 attributed += 1
                 totals = window.totals
                 if totals is not None and span > 0:
-                    totals[spec] = totals.get(spec, 0) + span
+                    totals[spec] += span
                     pairs += 1
             if last_cycle:
                 trow["first_cycle"] = first_cycle
                 trow["last_cycle"] = last_cycle
         elif full_name == "Misc.Bookmark":
+            values = decode.event_values(row, stream, event)
             cycle = decode.value_int(values, "Cycle")
             point = decode.value_int(values, "BookmarkPoint")
             if cycle is None or point is None:
@@ -564,6 +583,7 @@ def _walk_tid(
                 cycle=cycle, point=point, name=spec[0], file=spec[1], line=spec[2],
             ))
         elif full_name == "CpuProfiler.EndThread":
+            values = decode.event_values(row, stream, event)
             cycle = decode.value_int(values, "Cycle")
             if cycle is not None:
                 trow["end_cycle"] = cycle
@@ -575,11 +595,13 @@ def _walk_tid(
             region_counts["ends"] += 1
         elif full_name in ("Counters.SetValueInt", "Counters.SetValueFloat"):
             counts["counter_values"] += 1
+            values = decode.event_values(row, stream, event)
             counter_id = decode.value_int(values, "CounterId")
             if counter_id is not None:
                 key = str(counter_id)
                 counter_values[key] = counter_values.get(key, 0) + 1
         elif full_name == gpu.FRAME_EVENT:
+            values = decode.event_values(row, stream, event)
             gpu_row = gpu.frame_row(values, tid, values.get("Data"))
             if gpu_row is None:
                 anomalies.append((

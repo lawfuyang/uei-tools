@@ -157,12 +157,14 @@ three). Commands that need engine-provided tooling will take `--engine-dir` (or 
 | `goldens [--check\|--write] [--capture KEY] [-v]` | the corpus: re-runs the pinned commands over the captures this machine has and compares. Exit 0 matched / 1 a problem / 2 nothing to compare |
 
 The parse cache sits beside the capture, keyed by its SHA-256 and the tool version, and never
-changes an answer — only the seconds a command takes: measured on the corpus, a cold full decode
-is 6.98 s (the LZ4 half, in the C library, is 0.6 s of it, the per-thread walk runs over worker
-processes, and attributing each frame's work and occupancy costs ~1.1 s of it) and a cached command
-0.52 s. `--jobs N` sets how many processes that walk may use — any command that has to build the
-model — and `--jobs 0` (the default) chooses for the machine. It cannot change a byte of the
-output; the suite pins serial ≡ parallel.
+changes an answer — only the seconds a command takes: measured on the corpus (2026-09-29), a cold
+full decode is 5.69 s (the LZ4 half, in the C library, is 0.65 s of it, the per-thread walk runs
+over worker processes, and attributing each frame's work and occupancy costs ~1 s of it) and a
+cached command **0.23-0.29 s** — of which 0.17 s is interpreter startup, and the rest is hashing the
+capture (0.03 s) and parsing the cache (0.02 s), because the packet table is only walked by the
+commands that print it. `--jobs N` sets how many processes that walk may use — any command that has
+to build the model — and `--jobs 0` (the default) chooses for the machine. It cannot change a byte
+of the output; the suite pins serial ≡ parallel.
 
 Planned (see `ROADMAP.md`): the timer **call tree** and self time, thread occupancy findings,
 the critical path / task graph, source mapping, a `coverage` command that says whether a capture

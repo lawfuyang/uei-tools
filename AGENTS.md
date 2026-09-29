@@ -11,7 +11,7 @@ Any change to `src/py/` or `tests/` is not finished until all three pass:
 
 ```powershell
 python src\py\ueia.py lz4 --build       # step 0: bin/ueia_lz4.dll, built only when stale
-python src\py\ueia.py selftest          # the hermetic suite: ~20 s, exit 0 pass / 1 fail / 2 bad option
+python src\py\ueia.py selftest          # the hermetic suite: ~30 s, exit 0 pass / 1 fail / 2 bad option
 npx --yes pyright@latest                # must print: 0 errors, 0 warnings
 python src\py\ueia.py goldens --check   # the corpus: exit 0 matched / 1 a problem / 2 nothing to compare
 ```

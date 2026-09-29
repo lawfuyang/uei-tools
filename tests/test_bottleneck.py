@@ -43,6 +43,9 @@ GPU_SPEC_UI, GPU_SPEC_OPAQUE = 82058, 112898
 
 
 def _varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("a varint encodes an unsigned value; got %d (a delta that went backwards?)"
+                         % (value,))
     out = bytearray()
     while True:
         byte = value & 0x7F
@@ -501,6 +504,9 @@ class TestTheRealCaptures(UeiaTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.paths = goldens.capture_paths()
+        # each capture's model is a cold parse (~5-7 s), so it is built once for the class: the
+        # suite used to spend twenty seconds rebuilding the same three models for four tests
+        cls._models: Dict[str, Dict[str, Any]] = {}
 
     def _path(self, key: str) -> str:
         path = self.paths.get(key)
@@ -514,14 +520,16 @@ class TestTheRealCaptures(UeiaTestCase):
         The two findings that make this a real classification rather than a shrug: its GPU timeline
         lines up with the frame series (so the GPU really was idle), and most frames sit on a
         multiple of a display period -- an editor throttled to 3 FPS, not a game with a slow frame.
+        The command's own output (and its `--format csv` prose) is pinned by the corpus transcripts.
         """
-        code, _out, err = self.run_cli(["bottleneck", self._path("editor-pie-1"),
-                                        "--format", "csv"])
-        self.assertEqual(code, 0)
-        self.assertIn("unexplained 1320", err)
-        self.assertIn("frame-rate cap", err)
-        self.assertIn("GPU timeline: 1409 of 1410", err)
-        self.assertIn("game,", err.splitlines()[4] if len(err.splitlines()) > 4 else err)
+        model = self._model("editor-pie-1")
+        report, notes = bottleneck.classify(model, summary.parse_budget(None, None))
+        assert report is not None
+        self.assertEqual(report.counts["unexplained"], 1320)
+        self.assertEqual(report.counts["game"], 61)
+        self.assertIn("frame-rate cap", " ".join(notes))
+        self.assertIn("1409 of 1410", " ".join(notes))
+        self.assertIsNotNone(report.alignment)
 
     def test_the_editor_frames_are_the_three_fps_the_capture_shows(self) -> None:
         model = self._model("editor-pie-1")
@@ -572,8 +580,12 @@ class TestTheRealCaptures(UeiaTestCase):
     def _model(self, key: str) -> Dict[str, Any]:
         import commands
 
-        _view, model, _cached = commands.load_model(self._path(key))
-        return dict(model)
+        cached = TestTheRealCaptures._models.get(key)
+        if cached is None:
+            _view, model, _cached = commands.load_model(self._path(key))
+            cached = dict(model)
+            TestTheRealCaptures._models[key] = cached
+        return cached
 
 
 if __name__ == "__main__":

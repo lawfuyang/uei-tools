@@ -61,9 +61,21 @@ class RegistryLike(Protocol):
 
 
 def decode7bit(data: bytes, offset: int) -> Tuple[int, int]:
-    """One little-endian 7-bits-per-byte varint, as `FTraceUtils::Encode7bit` writes."""
-    value = 0
-    shift = 0
+    """One little-endian 7-bits-per-byte varint, as `FTraceUtils::Encode7bit` writes.
+
+    The one-byte form -- a batch record's cycle delta, a spec id -- is by far the commonest, and this
+    function is the single hottest thing in the tool (15.08 M calls and 10.5 s of a profiled serial
+    parse of the corpus, five times everything else on the list), so it is answered without entering
+    the loop at all. The slow path is otherwise unchanged, error cases included.
+    """
+    if offset >= len(data):
+        raise ValueError("7-bit value runs past the end of its buffer")
+    byte = data[offset]
+    if byte < 0x80:
+        return byte, offset + 1
+    value = byte & 0x7F
+    shift = 7
+    offset += 1
     while True:
         if offset >= len(data):
             raise ValueError("7-bit value runs past the end of its buffer")
@@ -181,9 +193,17 @@ def iter_thread_events(
     anomalies: List[Anomaly],
     counts: Dict[str, int],
 ) -> Iterator[RawEvent]:
-    """Yield every framed event of one thread's stream, in stream order."""
+    """Yield every framed event of one thread's stream, in stream order.
+
+    The schema is asked about a uid once and remembered: walking every event of the corpus used to
+    cost three method calls per event (`size`, `has_aux`, `is_sync`), which the profile put third on
+    the list of things this tool spends its time on. A uid's answers cannot change while a registry
+    is in use, so one dict lookup replaces them; the memo lives here, per thread, and is discarded
+    with the walk.
+    """
     offset = 0
     length = len(stream)
+    shapes: Dict[int, Tuple[bool, bool, int]] = {}
     while offset < length:
         uid_byte = stream[offset]
         if uid_byte & 1:
@@ -224,18 +244,20 @@ def iter_thread_events(
             ))
             return
 
-        row = registry.get(uid)
-        if row is None:
-            anomalies.append((
-                "unknown-uid", offset, uid,
-                "event uid %d is not declared by this capture; stopping at offset %d"
-                % (uid, offset),
-            ))
-            counts["unknown_uid"] += 1
-            return
-        size = registry.size(uid)
-        has_aux = registry.has_aux(uid)
-        if registry.is_sync(uid):
+        shape = shapes.get(uid)
+        if shape is None:
+            if registry.get(uid) is None:
+                anomalies.append((
+                    "unknown-uid", offset, uid,
+                    "event uid %d is not declared by this capture; stopping at offset %d"
+                    % (uid, offset),
+                ))
+                counts["unknown_uid"] += 1
+                return
+            shape = (registry.is_sync(uid), registry.has_aux(uid), registry.size(uid))
+            shapes[uid] = shape
+        sync_uid, has_aux, size = shape
+        if sync_uid:
             if offset + SYNC_EVENT_SERIAL_SIZE > length:
                 anomalies.append((
                     "truncated-event", offset, 0, "the event's serial runs past the stream",

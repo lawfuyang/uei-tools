@@ -17,6 +17,9 @@ from shapes import GpuFrameRow, GpuSpecRow
 
 def varint(value: int) -> bytes:
     """LEB128, the encoding the GPU batch's timestamps use."""
+    if value < 0:
+        raise ValueError("a varint encodes an unsigned value; got %d (a delta that went backwards?)"
+                         % (value,))
     out = bytearray()
     while True:
         byte = value & 0x7F

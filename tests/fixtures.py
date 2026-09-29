@@ -237,6 +237,9 @@ def event(
 
 def varint(value: int) -> bytes:
     """One little-endian 7-bits-per-byte varint, as the batch format packs them."""
+    if value < 0:
+        raise ValueError("a varint encodes an unsigned value; got %d (a delta that went backwards?)"
+                         % (value,))
     out = bytearray()
     while True:
         byte = value & 0x7F

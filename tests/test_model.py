@@ -57,6 +57,9 @@ _SPEC_COUNT = 9
 
 
 def _varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("a varint encodes an unsigned value; got %d (a delta that went backwards?)"
+                         % (value,))
     out = bytearray()
     while True:
         byte = value & 0x7F
@@ -412,6 +415,33 @@ class TestFrameWork(UeiaTestCase):
         self.assertEqual([spec for spec, _cycles in work["items"]], [8, 7, 6, 5, 4, 3],
                          "the biggest by inclusive cycles, then by spec id")
         self.assertEqual(counts["scope_pairs"], 8)
+
+    def test_the_coverage_union_does_not_move_its_left_edge(self) -> None:
+        """A parent that begins first and ends last, around two children written as any writer would.
+
+        The stream is one the writer could really emit (every timestamp moves forward: the parent's
+        begin, a child, a sibling, then the parent's end), and the pairs are popped in *end* order, so
+        the parent's span arrives last and overlaps a region whose left edge is its own. That is the
+        case a "disjoint interval" shortcut got wrong on 2026-09-29: the disjoint sibling moved the
+        merged region's left edge, so the parent's prefix was counted twice and the frame read
+        110,000 cycles of occupancy where the union is 90,000. One frame, one window, so what is
+        pinned here is the arithmetic alone.
+        """
+        stream = _frame_pair(
+            1000000, 2000000, 1,
+            body=_batch_event([
+                (1000000, 7, True),                          # the parent begins
+                (1100000, 7, True), (1200000, None, False),  # child one: [1.10, 1.20)
+                (1300000, 7, True), (1400000, None, False),  # sibling:   [1.30, 1.40)
+                (2000000, None, False),                      # the parent ends: spans it all
+            ]),
+        )
+        model, counts = self._model(self._trace({2: stream}))
+        self.assertEqual(counts["scope_pairs"], 3)
+        self.assertEqual(model["frames"][0]["covered_cycles"], 900000,
+                         "the union of the three spans, each cycle of it counted once")
+        self.assertEqual(model["frame_work"][0]["items"], [(7, 1200000)],
+                         "and the work stays inclusive: 100k + 100k + 1000k of the same spec")
 
     def test_frames_of_two_types_at_once_keep_their_own_totals(self) -> None:
         """The loop carries the current frame's totals in locals; nesting must not mix them.
