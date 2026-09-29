@@ -774,19 +774,30 @@ every level, top-N by self, and *any* frame of any thread.
   frame. The cache keeps the answers the reports ask for; this is a different question, asked on
   demand.
 
-**How a pair is placed, which is the one rule that matters here.** A scope is **present in every
-frame it overlaps**, clipped to each window, and its children *in a frame* are the pairs that closed
-inside it **in that frame** — a tree of intervals whose depth came from the wire. `self` is then the
-clip minus its children's clips, so the frame's self time is the sum over its roots, and the two
-agree by construction (`test_calltree` pins the invariant on the fixture and on a real capture).
-Siblings that name the same timer **merge**: one node with `calls` counting them, because "called 12
-times, 40 ms of it not in a callee" is what a reader wants, not twelve identical rows.
+**How a pair is placed: the model's own rule, one frame per pair.** A scope belongs to the frame that
+holds its **end** (the first frame with `end >= cycle`, the test `model`'s cursor makes) and is
+clipped at that frame's begin when it started earlier — the situation the walk counts as
+`scope_pairs_spanning`. Its children *in that frame* are the pairs that closed inside it there, so a
+tree of intervals whose depth came from the wire; `self` is the clip minus its children's clips, the
+frame's self time is the sum over its roots, and the two agree by construction (`test_calltree` pins
+that on the fixture and on a real capture). Siblings that name the same timer **merge**: one node with
+`calls` counting them, because "called 12 times, 40 ms of it not in a callee" is what a reader wants,
+not twelve identical rows.
 
-That is deliberately **not** the model's work attribution, which credits a pair to the frame its
-*end* falls in (§13). The difference is real for a scope that straddles a boundary: in this tree it
-appears in both frames, clipped (the walk counts the same situation as `scope_pairs_spanning`); in
-the frame work attribution it appears once. Both rules are stated where their numbers are printed, and
-neither is presented as the other.
+One consequence is not obvious and cost two attempts on the corpus (2026-09-29). A scope that *spans*
+many frames belongs to none of them but the last, so the pairs that closed inside the earlier frames
+while it was open have **no parent in those frames** and are promoted to **roots** there — by the
+promotion at the close of the spanning pair, and by `weigh` for a pair still open when a frame is
+weighed. A pair's own framing must not gate that promotion: the corpus's long engine scopes end
+*after the last frame*, and a promotion inside the "is this pair framed" branch never ran for them, so
+every frame read 0.000 ms while the pairs were being attributed correctly all along (the instrumented
+`weigh` showed `attributed=3108`, `roots=0`).
+
+This rule is the model's, deliberately, and it used to differ: the pass credited a scope to every
+frame it *overlapped* (§13's `scope_pairs_spanning` counted the same situation the other way). One
+rule everywhere means `self`, `summary` and `bottleneck` cannot answer the same question two ways —
+and it is also why the pass got faster, since the per-pair clipping it needed is gone (`editor-pie-1`:
+**17.48 → 9.64 s**).
 
 **What it counts rather than invents.** An end with no begin, a begin that never closed, a pair
 outside every frame — each is a number in the `pairing` line, never a guessed pair (the editor
@@ -808,14 +819,17 @@ short one inside it.
 
 | capture | frame | inside scopes | **self** | the tree's shape |
 |---|---|---|---|---|
-| `game-pc-2` (tid 2) | #0 | 905.104 ms | **2.003 ms** | `FEngineLoop::Tick` → `FlushRenderingCommands` 670.799 → **`GameThreadWaitForTask` 670.761 self**: the frame is *waiting*, not computing — an answer `summary` cannot give |
-| `game-pc-2` worst three | #0, #77, #888 | | 2.003 / 0.913 / 0.800 ms | |
-| `editor-pie-1` (tid 2) | #0 | 2,102.406 ms | **1,780.730 ms** | `FEngineLoop::Tick` holds the frame and almost all of it is self: an editor starting a PIE session is doing its own work |
-| `editor-pie-1` worst three | #0, #26, #50 | | 1,780.730 / 441.152 / 433.775 ms | |
+| `game-pc-2` (tid 2) | #52 | 816.212 ms | **815.384 ms** | three roots, and `WinPumpMessages 815.133 / 815.133 ms x1` is almost all of it: the worst frame in the capture is the engine pumping its own message loop — an answer `summary` cannot give |
+| `game-pc-2` worst three | #52, #60, #36 | | 815.384 / 177.750 / 164.073 ms | the three are 8.2 s / 1.8 s / 1.7 s frames: the hitch frames, self time and all |
+| `editor-pie-1` (tid 2) | #2 | 1,411.885 ms | **1,092.902 ms** | roots are the engine's own frame plumbing — `Bv.OnBeginFrame_Kick`, `FRenderCommandPipe_StartRecording`, `FStats::AdvanceFrame` — so most of the frame is the tool's own bookkeeping |
+| `editor-pie-1` worst three | #2, #2350, #2352 | | 1,092.902 / 1,070.537 / 1,054.345 ms | |
 
-**Cost, and why it is not a golden transcript.** The pass is per thread and per run: 7.25 s over the
-game capture's tid 2, 17.48 s over the editor's, on top of the streams assembly the command needs
-(~0.3 s of it is the cached model the frame list comes from). Pinning it in the corpus harness would
+**Cost, and why it is not a golden transcript.** The pass is per thread and per run: **3.89 s** over
+the game capture's tid 2 and **9.64 s** over the editor's, on top of the streams assembly the command
+needs (~0.3 s of it is the cached model the frame list comes from). Both fell when the rule became
+the model's — 7.25 s and 17.48 s before it — because the per-pair clipping the overlap rule needed is
+gone; what is left is the decode the format forces (each thread's records are delta-encoded, so no
+pass can skip any of them). Pinning it in the corpus harness would
 add that to `goldens --check` for every registered capture, so it is **not** in
 `goldens.PINNED_COMMANDS` — a decision, not an oversight: the harness pins commands whose cost is a
 fraction of a second, and the suite covers this one hermetically (the fixture, hand-computed) plus

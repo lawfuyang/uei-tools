@@ -52,14 +52,20 @@ class TestTheFixtureTree(UeiaTestCase):
         return report, {index: (trees.get(index), count) for index, count in per_frame.items()}
 
     def test_the_three_frames_carry_the_hand_computed_self_times(self) -> None:
-        """F0 60 ms, F1 30 ms, F2 80 ms -- and the trees agree with those totals."""
+        """F0 60 ms, F1 **20** ms, F2 80 ms -- and the trees agree with those totals.
+
+        F1 is 20 ms because of the one rule (2026-09-29): the 20 ms `FrameTime` that starts inside F1
+        and ends inside F2 belongs to **F2**, clipped at F2's begin, so F1 keeps only its own
+        `WorkerTask`. `test_a_scope_that_straddles_a_boundary_belongs_where_it_ends` asserts the same
+        fact directly.
+        """
         report, _trees = self._pass()
         self.assertEqual(report.pairs, 7, "seven real pairs")
         self.assertEqual(report.ends_unpaired, 1, "the end with no begin, counted not invented")
         self.assertEqual(report.begins_unpaired, 1, "and the begin that never closed")
         ranked = [(int(row["index"]), count) for row, count in report.frame_self]
-        self.assertEqual(ranked, [(2, 80000), (0, 60000), (1, 30000)],
-                         "ranked by self: F2 80 ms, F0 60 ms, F1 30 ms")
+        self.assertEqual(ranked, [(2, 80000), (0, 60000), (1, 20000)],
+                         "ranked by self: F2 80 ms, F0 60 ms, F1 20 ms")
         self.assertEqual(int(report.frame["index"]), 2, "the worst frame by *self* time")
 
     def test_the_longest_frame_is_not_the_worst_one(self) -> None:
@@ -98,17 +104,26 @@ class TestTheFixtureTree(UeiaTestCase):
         self.assertEqual((wait.children[0].name, wait.children[0].self),
                          ("WorkerTask", 5000))
 
-    def test_a_scope_that_straddles_a_boundary_is_in_both_frames_clipped(self) -> None:
-        """F1 gets the first 10 ms of it, F2 the second 10 ms, and neither gets all 20."""
+    def test_a_scope_that_straddles_a_boundary_belongs_where_it_ends(self) -> None:
+        """One rule everywhere: the straddler is *F2's*, clipped at F2's begin, not shared with F1.
+
+        `model` attributes a scope to the frame its end falls in and clips its begin at that frame
+        (`scope_pairs_spanning` counts exactly this). The pass used to disagree -- the scope was in
+        both frames, clipped on both edges -- so `self` and `summary` could answer the same question
+        two ways (2026-09-29). The corpus then showed what the rule implies: a scope that spans many
+        frames belongs to none of them but the last, so the pairs that closed inside the earlier ones
+        are promoted to **roots** there (`weigh`, and the promotion at the close of the spanning
+        pair) -- otherwise those frames read empty, which is what happened on the game capture.
+        """
         _report, trees = self._pass()
         first = trees[1][0]
         second = trees[2][0]
         assert first is not None and second is not None
-        by_name = {node.name: node for node in first}
-        self.assertEqual((by_name["FrameTime"].inclusive, by_name["FrameTime"].calls), (10000, 1))
+        self.assertEqual([node.name for node in first], ["WorkerTask"],
+                         "the straddler ends in F2, so F1 does not have it at all")
         f2_root = next(node for node in second if node.name == "FrameTime")
         self.assertEqual((f2_root.inclusive, f2_root.calls), (80000, 2),
-                         "10 ms of the straddler merged with F2's own 70 ms")
+                         "10 ms of the straddler (clipped at F2's begin) merged with F2's own 70 ms")
 
     def test_the_tree_and_the_frame_total_agree(self) -> None:
         """The invariant the report rests on: the roots' self is the frame's self, always."""

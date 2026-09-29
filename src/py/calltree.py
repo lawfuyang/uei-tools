@@ -215,38 +215,51 @@ def stream_thread(stream: bytes, tid: int, registry: "schema.SchemaRegistry",
             entry = stack.pop()
             pairs += 1
             begin = int(entry[1])
-            # the first frame that begins after this pair's begin: a pair closed out of begin order
-            # (a long scope closes after a short one that started inside it) must still find the
-            # frames it *started* in, so this is a search and not a cursor that only moves forward
-            scan = bisect.bisect_right(frame_ends, begin)
-            while scan < len(windows) and windows[scan][1] < cycle:
-                index, wbegin, wend = windows[scan]
-                span = clip(begin, cycle, wbegin, wend)
-                if not span:
-                    scan += 1
-                    continue
-                entry[2][index] = span
-                parent = stack[-1] if stack else None
-                if parent is None:
-                    roots.setdefault(index, []).append(entry)
-                else:
-                    parent[3].setdefault(index, []).append(entry)
-                    parent[4][index] = int(parent[4].get(index, 0)) + span
-                if scan > pending:
-                    # a newer frame is being filled: the older ones can no longer gain a pair,
-                    # because a pair's frames are contiguous and it is inside every open pair.
-                    # `pending` and `scan` are **positions in this series**, not frame indices --
-                    # weighing indices invented a row for every index the series does not have and
-                    # skipped the rows it does (the corpus's `0, 2, 4` series; the game capture
-                    # reported 0.000 ms because of it, 2026-09-29)
-                    while 0 <= pending < scan:
-                        if any(int(open_pair[1]) < windows[pending][2] for open_pair in stack):
-                            break
-                        weigh(frame_ids[pending])
-                        pending += 1
-                    if pending < scan:
-                        pending = scan
-                scan += 1
+            # **the model's own rule, one frame per pair**: the frame whose window holds this pair's
+            # END (`end >= cycle`, what `model`'s cursor tests), clipped at that frame's begin when it
+            # started earlier -- the case `model` counts as `spanning`. This used to be "present in
+            # every frame it overlaps", which disagreed with every other report about a boundary
+            # (2026-09-29: one rule everywhere, so `self` and `summary` cannot answer the same
+            # question two ways).
+            scan = bisect.bisect_left(frame_ends, cycle)
+            framed = scan < len(windows) and windows[scan][1] <= cycle
+            # **The promotion, before the pair's own fate is decided.** Children this pair holds for
+            # other frames closed in frames this pair is not part of, so they are those frames'
+            # *roots*: the rule gives this pair to the frame its own end falls in, so it is absent
+            # from theirs. It has to happen whether or not this pair is framed at all -- the corpus's
+            # long engine scopes end *after the last frame*, so a promotion inside the `framed` branch
+            # never ran for them, and every pair that closed inside the early frames stayed attached
+            # to an entry nobody would ever see. The frames read empty (found 2026-09-29 by
+            # instrumenting `weigh`: `attributed=3108`, `roots=0`).
+            if entry[3]:
+                for other_frame, kids in entry[3].items():
+                    if kids and (not framed or other_frame != frame_ids[scan]):
+                        roots.setdefault(other_frame, []).extend(kids)
+                        entry[3][other_frame] = []
+            if framed:
+                index = frame_ids[scan]
+                _wbegin = windows[scan][1]
+                if begin < _wbegin:
+                    begin = _wbegin
+                span = cycle - begin
+                if span > 0:
+                    entry[2][index] = span
+                    parent = stack[-1] if stack else None
+                    if parent is None:
+                        roots.setdefault(index, []).append(entry)
+                    else:
+                        parent[3].setdefault(index, []).append(entry)
+                        parent[4][index] = int(parent[4].get(index, 0)) + span
+                    if scan > pending:
+                        # the pairs close in *end* order, so once the cursor is past a frame every
+                        # pair that ends inside it has been seen -- unless a frame further out is
+                        # still open and began before it ends, which is why `weigh` also promotes
+                        # what a pair still on the stack is holding for this frame
+                        while 0 <= pending < scan:
+                            weigh(frame_ids[pending])
+                            pending += 1
+                        if pending < scan:
+                            pending = scan
     counts["begins_unpaired"] = counts.get("begins_unpaired", 0) + len(stack)
     for position in range(len(frame_ids)):
         weigh(frame_ids[position])
