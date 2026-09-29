@@ -19,10 +19,12 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, cast
 
+import advice
 import bottleneck
 import cache
 import container
@@ -51,10 +53,17 @@ from shapes import (
 )
 
 FORMATS = ("table", "csv", "markdown")
+#: The machine form `advice` also takes: a schema-versioned document rather than a table (README
+#: §4's output philosophy). Kept out of `FORMATS` because the table commands have no JSON form --
+#: a report that prints a `meta` block and findings is a different shape of answer, not a rendering
+#: of the same table.
+JSON_FORMAT = "json"
 _VALUE_OPTIONS = frozenset((
     "format", "limit", "tid", "filter", "jobs", "engine-dir",
     # the summary layer: a budget in either of the two spellings the practice uses
     "budget", "budget-ms",
+    # and `advice`'s rule filter: a comma-separated list of rule ids to drop
+    "skip",
     # the task graph's export form
     "graph",
     # the csv family: ours on the left, the exe's own flag in `_csv_*` below
@@ -547,6 +556,73 @@ def cmd_frames(capture: str, args: List[str]) -> int:
         (True, True, True, True, True, True),
         options.fmt(),
         prose,
+    )
+    return 0
+
+
+def cmd_advice(capture: str, args: List[str]) -> int:
+    """`advice <capture> [--budget ...] [--tid N] [--skip IDS] [--limit N]`: what to do next.
+
+    The practice's last question, answered as rules over the measurements the other reports already
+    make: the budget verdict, the tail, the bottleneck, the occupancy, the source mapping, the
+    channel inventory. Every finding carries its evidence, the file:line where the trace has one, and
+    the next command to run (`advice.py` has the rules and the ranking). `--format json` is the
+    machine form -- schema-versioned, with a `meta` block -- and `--skip id,id` drops rules.
+
+    Exit codes: 0 always (this is the command that always has something to say, even if it is "this
+    capture carries no frame pair"), 2 a usage error, 1 a failure.
+    """
+    options = parse_options(args)
+    if options.values.keys() - {"budget", "budget-ms", "tid", "limit", "skip", "format", "jobs",
+                               "engine-dir"} or options.flags:
+        raise UsageError(
+            "advice takes --budget, --budget-ms, --tid, --limit, --skip, --engine-dir, --format "
+            "and --jobs"
+        )
+    fmt = options.text("format", "table")
+    if fmt not in FORMATS + (JSON_FORMAT,):
+        raise UsageError("--format is one of %s, got %r"
+                         % ("|".join(FORMATS + (JSON_FORMAT,)), fmt))
+    budget = summary.parse_budget(options.values.get("budget"), options.values.get("budget-ms"))
+    explicit = bool(options.values.get("budget") or options.values.get("budget-ms"))
+    skipped = tuple(part.strip() for part in options.text("skip").split(",") if part.strip())
+    limit = options.number("limit", _DEFAULT_BREAKER_LIMIT)
+    root, notes = _engine_dir(options)
+    started = time.monotonic()
+    view, model, _cached = load_model(capture, _jobs(options))
+    context = advice.context(model, budget, explicit, root, capture)
+    findings = advice.build(context, skipped)
+    seconds = time.monotonic() - started
+    if fmt == JSON_FORMAT:
+        document = advice.document(findings, context, cache.capture_identity(Path(capture)), root,
+                                   seconds)
+        sys.stdout.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
+        return 0
+    session = model.get("session", {})
+    duration = seconds_for_cycle(model, int(session.get("last_cycle", 0)))
+    lines = ["capture   : %s%s" % (
+        view.path.name, ", %.3f s" % (duration,) if duration is not None else "",
+    )]
+    identity = " / ".join(
+        part for part in (
+            str(session.get("app", "")), str(session.get("project", "")),
+            str(session.get("target", "")),
+        ) if part
+    )
+    if identity:
+        lines.append("session   : %s" % (identity,))
+    lines.append("budget    : %s%s" % (
+        budget.label(), "" if explicit else " (the default: no --budget was given)",
+    ))
+    lines.extend(notes)
+    prose, rows = advice.lines(findings, context, limit)
+    lines.extend(prose)
+    render_rows(
+        ("id", "severity", "confidence", "effort", "where", "next command"),
+        rows,
+        (False, False, False, False, False, False),
+        fmt,
+        lines,
     )
     return 0
 
@@ -1749,6 +1825,7 @@ __all__ = [
     "cmd_threads",
     "cmd_timers",
     "cmd_frames",
+    "cmd_advice",
     "cmd_bottleneck",
     "cmd_parallelism",
     "cmd_sources",

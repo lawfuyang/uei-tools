@@ -662,3 +662,47 @@ reaches from the timing side, reached here from the names.
 Cost: nothing measurable. This report adds no model field and reads no new bytes — the specs' file
 and line were already in the cache (§3) — so a warm `sources` is the same 0.3 s as any other cached
 command, and the cache version did not change for it.
+
+## 15. The recommendations engine (`advice`) — rules, ranking, and the machine form
+
+The practice's last question is *"so what do I do?"*, and `ueia advice` answers it as **rules over the
+measurements the reports above already make** — never as new measurements. Each finding carries
+`severity` (impact), `effort` (what the fix costs), `confidence` (`certain` / `heuristic` /
+`unknown`, the vocabulary the rest of this repo uses), the evidence it was derived from, the
+`file:line` where the trace has one, and **the next command to run**. The list is ranked
+**severity → confidence → effort → id**, and the order is documented because a reader will disagree
+with it: impact first, a certain finding before a heuristic one of the same impact, cheap fixes
+before expensive ones.
+
+The rules, and what each one is standing in for (the practice's own checklist):
+
+| rule | fires when | category |
+|---|---|---|
+| `budget-default` | no `--budget` was given: the report ran against 60 FPS | budget |
+| `no-frames` / `no-frequency` | no `Misc.BeginFrame` pair, or no cycle frequency: the frame questions cannot be answered | data |
+| `frame-cap` | ≥25% of the frames sit within 5% of a **small** (≤4) multiple of a display period — the throttle shape | frames |
+| `over-budget` / `hitches` / `tail-vs-mean` / `thin-sample` | the distribution itself: shares that miss the budget, hitches over `2 x budget`, p99 ≥ 2 x p50, or too few frames to have percentiles | frames |
+| `bound-thread` / `bound-unexplained` | the bottleneck verdict: which thread owns the frames, or that **nothing this capture recorded** explains them | cpu |
+| `one-timer` | one timer owns ≥ 25% of the frames the model keeps (`parallel`'s candidates), with its file:line | cpu |
+| `workers-idle` | ≥ 80% of the frame thread's work had no other thread working beside it | parallelism |
+| `sync-load` / `async-loading` | a named synchronous load with a share, or an over-budget frame whose kept timers are ≥ 25% async-loading names | streaming |
+| `gpu-unknown` / `task-unknown` / `csv-no-values` | a channel that is absent (or registered with no values recorded): the re-record line, said as a finding | channels |
+| `attribution-gaps` / `anomalies` | what the parse itself could not attribute or read cleanly: every number above is then a floor | data |
+
+**`frame-cap` is stricter than `bottleneck.cap_note` on purpose**: a 905 ms frame is within 5% of 54
+display periods, so *any* slow frame is "a multiple of a period" if the multiple may grow with the
+frame. The rule accepts multiples of at most 4 (a genuine 30/60/120 FPS throttle) and names the
+period and the multiple it found. On the corpus that is the difference between the editor capture
+(55% of its frames on `2 x 16.667 ms`: a finding) and the game capture (905 ms frames: not one).
+
+The machine form is `--format json`: `{"schema": "ueia.advice/1", "meta": {...}, "findings": [...]}`,
+schema-versioned, with the `meta` block of README §4 — tool version, the capture's SHA-256 and size,
+the session, the budget and whether it was given, the engine directory as configured, the analysis
+duration, the **limitations** (every analysis that could not run, and why), and `executables` as an
+empty list because this report wraps no engine program: stated rather than omitted, so "none" and
+"not asked" read differently. `--skip id,id` drops rules; an unknown id is a usage error rather than
+a filter that quietly matched nothing.
+
+`advice` is the one report that **always exits 0**: it is the command that has something to say about
+every capture, including "this capture carries no frame pair" — which is its first finding, and the
+most severe one.

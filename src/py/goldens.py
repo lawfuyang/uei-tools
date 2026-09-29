@@ -43,6 +43,7 @@ PINNED_COMMANDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("bottleneck", ("--budget", "60")),
     ("parallelism", ("--budget", "60")),
     ("sources", ("--budget", "60", "--limit", "12")),
+    ("advice", ("--budget", "60")),
     ("tasks", ()),
     ("threads", ("--format", "csv")),
     ("timers", ("--format", "csv", "--limit", "0")),

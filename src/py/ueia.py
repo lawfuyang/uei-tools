@@ -37,6 +37,11 @@ Commands:
                               and every absence said out loud (--budget, --budget-ms,
                               --tid, --limit; exit 2 when the capture has no frames, no
                               cycle frequency or no scopes)
+  advice <capture>            what to do next: rule-based findings over the other
+                              reports, ranked by impact/confidence/effort, each with
+                              its evidence, its file:line and the next command to run
+                              (--skip IDS drops rules, --limit N caps the table, and
+                              --format json is the schema-versioned machine form)
   sources <capture>           where the timers live: the trace's own file:line mapped
                               into engine vs project by the shape of the path, weighted
                               by the work the model keeps, and cross-referenced with
@@ -110,6 +115,7 @@ from shapes import *  # noqa: F401,F403
 from streams import *  # noqa: F401,F403
 from timing import *  # noqa: F401,F403
 from commands import (
+    cmd_advice,
     cmd_bottleneck,
     cmd_cache,
     cmd_csv,
@@ -139,6 +145,7 @@ _CAPTURE_COMMANDS = {
     "threads": cmd_threads,
     "timers": cmd_timers,
     "frames": cmd_frames,
+    "advice": cmd_advice,
     "bottleneck": cmd_bottleneck,
     "summary": cmd_summary,
     "parallelism": cmd_parallelism,
