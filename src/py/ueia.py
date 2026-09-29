@@ -30,6 +30,13 @@ Commands:
                               (--budget FPS | --budget-ms MS, default 60 FPS; --tid N
                               picks the frame series, --limit N the rows; exit 2 when
                               the capture has no frames or no cycle frequency)
+  parallelism <capture>       was the work spread? Per thread: busy / waiting / lock
+                              cycles inside the frame series' own frames, the frame
+                              thread's solo work, the most threads ever working at once
+                              and the lock overlap -- every ceiling Amdahl on a measure,
+                              and every absence said out loud (--budget, --budget-ms,
+                              --tid, --limit; exit 2 when the capture has no frames, no
+                              cycle frequency or no scopes)
   verify <capture>            walk everything and report what does not add up
                               (exit 1 when anything error-level was found)
   parse <capture>             build (and cache) the session model; prints what it holds
@@ -104,6 +111,7 @@ from commands import (
     cmd_info,
     cmd_lz4,
     cmd_packets,
+    cmd_parallelism,
     cmd_parse,
     cmd_schema,
     cmd_selftest,
@@ -126,6 +134,7 @@ _CAPTURE_COMMANDS = {
     "frames": cmd_frames,
     "bottleneck": cmd_bottleneck,
     "summary": cmd_summary,
+    "parallelism": cmd_parallelism,
     "tasks": cmd_tasks,
     "verify": cmd_verify,
     "parse": cmd_parse,

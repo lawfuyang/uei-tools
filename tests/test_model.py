@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, cast
 from testcase import UeiaTestCase
 
 import container
+import coverage
 from model import (
     SessionModel,
     ThreadShare,
@@ -20,16 +21,18 @@ from model import (
     _FRAME_WORK_TOP,
     _PARALLEL_MIN_BYTES,
     _parallel_shares,
+    _spec_kinds,
     _walk_tid,
     _worker_init,
     _worker_walk,
     _workers_for,
     build_model,
     seconds_for_cycle,
+    span_kind,
     zero_counts,
 )
 import schema
-from shapes import UeiaError
+from shapes import TimerRow, UeiaError
 import streams
 from fixtures import (
     EVENT_FLAG_IMPORTANT,
@@ -42,6 +45,7 @@ from fixtures import (
     important_record,
     new_event_record,
     pack,
+    parallel_trace,
     work_importants,
     work_schema,
     work_stream,
@@ -584,6 +588,127 @@ class TestParallelWalk(UeiaTestCase):
         self.assertEqual(_workers_for(big, 1), 1, "an explicit 1 is serial")
         self.assertEqual(_workers_for(big, 99), 3, "more workers than units is pointless")
         self.assertEqual(_workers_for(big, 2), 2)
+
+
+class TestTheCoverageTimeline(UeiaTestCase):
+    """The walk's per-thread coverage timeline: what the parallelism report is measured from.
+
+    The timelines are the walk's own output and live only until the frames are folded into them
+    (`coverage.measure_frames`), so these tests walk a fixture's thread directly and unpack the
+    share -- the same level `TestFrameWork` works at, and for the same reason: what the walk emits is
+    what a report can be built on, and it must not depend on the frames being read afterwards.
+    """
+
+    #: The fixture's specs as kinds: 8 `FrameTime` (work), 9 `WaitForTasks` (wait), 10 `WorkerTask`
+    #: (work), 11 `FScopeLock` (lock) -- one byte per spec, as `_spec_kinds` builds it.
+    KINDS = bytes(bytearray(
+        coverage.SPAN_LOCK if index == 11
+        else coverage.SPAN_WAIT if index == 9
+        else coverage.SPAN_WORK
+        for index in range(12)
+    ))
+
+    def _walk(self, tid: int, specs: Optional[bytes]) -> ThreadShare:
+        data = parallel_trace()
+        rows, _anomalies = container.walk_packets(data, container.parse_header(data))
+        stream_set = streams.assemble(data, rows)
+        registry = schema.build_registry(stream_set.streams[0], [], zero_counts())
+        return _walk_tid(tid, stream_set.streams[tid], registry, {}, specs)
+
+    def _share(self, tid: int) -> ThreadShare:
+        return self._walk(tid, self.KINDS)
+
+    def test_the_timeline_is_one_interval_per_outermost_span(self) -> None:
+        """The game thread's frame holds a wait *and* a lock inside one scope: still one interval."""
+        share = self._share(2)
+        self.assertEqual(
+            coverage.unpack(share["spans"]), [1002000, 1018000, 1022000, 1030000],
+            "FrameTime twice: the nested wait and lock close inside the first one",
+        )
+        self.assertEqual(coverage.unpack(share["wait_spans"]), [1010000, 1014000])
+        self.assertEqual(coverage.unpack(share["lock_spans"]), [1014000, 1016000])
+        self.assertEqual(share["counts"]["scope_spans"], 2)
+
+    def test_a_thread_with_no_frames_still_has_a_timeline(self) -> None:
+        share = self._share(4)
+        self.assertEqual(coverage.unpack(share["spans"]), [1005000, 1012000, 1015000, 1017000])
+        self.assertEqual(coverage.unpack(share["wait_spans"]), [])
+        self.assertEqual(coverage.unpack(share["lock_spans"]), [1015000, 1017000])
+        self.assertEqual(share["frames"], [], "no frames of its own -- and a timeline all the same")
+
+    def test_no_timer_specs_means_no_timeline(self) -> None:
+        share = self._walk(2, None)
+        self.assertEqual(share["spans"], b"")
+        self.assertEqual(share["counts"]["scope_spans"], 0)
+
+    def test_the_per_thread_cap_merges_what_it_cannot_keep_and_counts_it(self) -> None:
+        """`coverage.SPAN_KEEP` is a bound on the model, and a coarsened timeline says so.
+
+        The cap is lowered for the test -- a real capture would need 262,144 spans in a fixture --
+        and the fixture's two outermost spans become one, which *overstates* coverage by the gap
+        between them (the direction a parallelism claim must fail in, never understate).
+        """
+        original = coverage.SPAN_KEEP
+        coverage.SPAN_KEEP = 1
+        self.addCleanup(setattr, coverage, "SPAN_KEEP", original)
+        share = self._share(2)
+        self.assertEqual(coverage.unpack(share["spans"]), [1002000, 1030000])
+        self.assertEqual(share["spans_coarsened"], 1)
+        self.assertEqual(share["counts"]["spans_coarsened"], 1)
+
+    def test_the_lock_words_are_matched_on_camel_case_words(self) -> None:
+        """`AllocateHeapBlock` is not a lock, and a case-insensitive substring would say it is."""
+        self.assertEqual(span_kind("FScopeLock"), coverage.SPAN_LOCK)
+        self.assertEqual(span_kind("AcquireGCLock"), coverage.SPAN_LOCK)
+        self.assertEqual(span_kind("FCriticalSection"), coverage.SPAN_LOCK)
+        self.assertEqual(span_kind("FMutex::Lock"), coverage.SPAN_LOCK)
+        self.assertEqual(span_kind("AllocateHeapBlock"), coverage.SPAN_WORK)
+        self.assertEqual(span_kind("FBlockDecoder::TryDecompressTo"), coverage.SPAN_WORK)
+        self.assertEqual(span_kind("WaitForTasks"), coverage.SPAN_WAIT)
+        self.assertEqual(span_kind("ParallelFor.Wait"), coverage.SPAN_WAIT)
+        self.assertEqual(span_kind("UWorld::Tick"), coverage.SPAN_WORK)
+
+    def test_spec_kinds_is_none_without_specs_and_a_byte_per_spec_with_them(self) -> None:
+        self.assertIsNone(_spec_kinds({}))
+        kinds = _spec_kinds({
+            1: TimerRow(id=1, name="Tick", file="", line=0),
+            3: TimerRow(id=3, name="WaitForTasks", file="", line=0),
+            5: TimerRow(id=5, name="FScopeLock", file="", line=0),
+        })
+        assert kinds is not None
+        self.assertEqual(list(kinds), [coverage.SPAN_WORK, coverage.SPAN_WORK, coverage.SPAN_WORK,
+                                       coverage.SPAN_WAIT, coverage.SPAN_WORK, coverage.SPAN_LOCK],
+                         "one byte per spec id: 1 work, 3 wait, 5 lock")
+
+    def test_the_model_carries_one_occupancy_row_per_frame(self) -> None:
+        """The measurement's alignment invariant: row *i* belongs to frame *i*, whatever it holds.
+
+        `work_trace` has a frame nothing ran in, so the rows cannot be "one per thread": a row
+        exists exactly when something was measured inside that window, and that is the honest shape.
+        """
+        model = self._model(work_trace())
+        frames = model["frames"]
+        occupancy = model["frame_occupancy"]
+        self.assertEqual(len(occupancy), len(frames))
+        for index, entry in enumerate(occupancy):
+            self.assertEqual(int(entry["frame"]), index)
+            self.assertEqual(int(entry["tid"]), int(frames[index]["tid"]))
+            own = [row for row in entry["threads"] if int(row["tid"]) == int(frames[index]["tid"])]
+            covered = int(frames[index]["covered_cycles"] or 0)
+            self.assertEqual(bool(own), covered > 0,
+                             "a frame the thread covered has its own row, and one it did not has none")
+
+    def test_the_timelines_are_not_kept_in_the_model(self) -> None:
+        """Only the measurement is cached: 780 k intervals would not fit a JSON cache."""
+        model = self._model(work_trace())
+        self.assertNotIn("spans", model)
+        self.assertNotIn("wait_spans", model)
+        self.assertTrue(model["thread_spans"], "the per-thread totals are, and they are bounded")
+
+    def _model(self, data: bytes) -> SessionModel:
+        rows, _anomalies = container.walk_packets(data, container.parse_header(data))
+        model, _counts, _all = build_model(streams.assemble(data, rows))
+        return model
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ import container
 import csvprof
 import engine
 import lz4
+import parallel
 import schema
 import summary
 import tasks
@@ -71,6 +72,9 @@ _BOOL_OPTIONS = frozenset((
 
 _DEFAULT_PACKET_LIMIT = 40
 _DEFAULT_FRAME_LIMIT = 40
+#: How many threads the parallelism table lists by default: the ones with work in the frame series
+#: are few, and a pool of idle workers is one line each; `--limit 0` lists every one of them.
+_DEFAULT_THREAD_LIMIT = 20
 #: How many over-budget frames `summary` lists by default. Ten fits a page and is the worst of the
 #: tail, which is what the practice says to look at; `--limit 0` asks for every one of them.
 _DEFAULT_BREAKER_LIMIT = 10
@@ -672,7 +676,7 @@ def cmd_bottleneck(capture: str, args: List[str]) -> int:
     the GPU -- or by none of them (a wait, a cap, or something this capture cannot see)? Every
     verdict is a measurement against the budget: the thread's own non-wait scope coverage, the
     sibling series' coverage inside the same frame, and the GPU's busy time when the capture carries
-    the legacy GPU channel. The rule from ROADMAP §1 is enforced in the output: a capture with no
+    the legacy GPU channel. The rule is enforced in the output (REFERENCE §11): a capture with no
     GPU data gets its CPU finding *plus* "the GPU side is unknown here" and the re-record line, never
     a bare "CPU-bound".
 
@@ -888,6 +892,101 @@ def cmd_tasks(capture: str, args: List[str]) -> int:
         ("task", "ms", "thread", "frame", "name"),
         rows,
         (True, True, False, True, False),
+        options.fmt(),
+        lines,
+    )
+    return 0
+
+
+def cmd_parallelism(capture: str, args: List[str]) -> int:
+    """`parallelism <capture> [--budget FPS|--budget-ms MS] [--tid N] [--limit N]`: was it spread?
+
+    The practice's first question about a slow frame after "what bounds it": **how much of the
+    machine was ever working beside the frame thread?** The occupancy table is per thread -- busy,
+    waiting and lock-named cycles inside the frame series' own windows, measured by the walk and
+    folded into frames at build time (`coverage.measure_frames`) -- and the findings are the
+    measured ones: the frame thread's **solo** work, the most threads working at once, lock
+    overlap, and the timers that own a quarter of the frames the model keeps. Every ceiling printed
+    is Amdahl on a measured share and is labelled a heuristic; a capture with no frames, no cycle
+    frequency or no scopes exits 2 rather than printing zeroes.
+
+    Exit codes: 0 a report was produced, 2 the capture cannot answer, 1 a failure.
+    """
+    options = parse_options(args)
+    if options.values.keys() - {"budget", "budget-ms", "tid", "limit", "format", "jobs"} \
+            or options.flags:
+        raise UsageError(
+            "parallelism takes --budget, --budget-ms, --tid, --limit, --format and --jobs"
+        )
+    budget = summary.parse_budget(options.values.get("budget"), options.values.get("budget-ms"))
+    limit = options.number("limit", _DEFAULT_THREAD_LIMIT)
+    tid = options.number("tid", -1)
+    view, model, _cached = load_model(capture, _jobs(options))
+    report, reasons = parallel.classify(model, budget, None if tid < 0 else tid)
+    session = model.get("session", {})
+    duration = seconds_for_cycle(model, int(session.get("last_cycle", 0)))
+    lines: List[str] = []
+    if report is None:
+        lines.append("capture   : %s" % (view.path.name,))
+        for reason in reasons:
+            lines.append("cannot    : %s" % (reason,))
+        lines.append("hint      : `parallelism` needs frame pairs, a cycle frequency and "
+                     "CpuProfiler scopes in the same capture")
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        return 2
+    frequency = int(session.get("cycle_frequency", 0) or 0)
+    lines.append("capture   : %s%s" % (
+        view.path.name, ", %.3f s" % (duration,) if duration is not None else "",
+    ))
+    identity = " / ".join(
+        part for part in (
+            str(session.get("app", "")), str(session.get("project", "")),
+            str(session.get("target", "")),
+        ) if part
+    )
+    if identity:
+        configuration = str(session.get("configuration", ""))
+        build = str(session.get("build_version", ""))
+        qualifiers = ", ".join(part for part in (configuration, build) if part)
+        lines.append("session   : %s%s" % (identity, " (%s)" % (qualifiers,) if qualifiers else ""))
+    lines.append("frames    : %s, spanning %s" % (
+        report.series.describe(),
+        "%.3f s" % (report.series.span_s,) if report.series.span_s is not None else "?",
+    ))
+    lines.append("budget    : %s" % (budget.label(),))
+    lines.append("verdict   : %s" % (parallel.verdict_text(report, frequency),))
+    lines.append("occupancy : %s" % (parallel.occupancy_text(report),))
+    lines.extend(parallel.finding_lines(report, frequency))
+    shown = report.threads if limit == 0 else report.threads[:limit]
+    rows: List[Tuple[str, ...]] = []
+    for row in shown:
+        note = ""
+        if row.tid == report.series.tid:
+            note = "the frame thread: %s of its work was solo" % (
+                parallel.share_text(report.solo, report.own_work()),)
+        elif row.coarsened:
+            note = "timeline coarsened at the cap (%d span(s) merged: coverage overstated)" % (
+                row.coarsened,)
+        elif row.elsewhere:
+            note = "no coverage in these frames"
+        elif row.busy_cycles and row.wait_cycles * 2 >= row.busy_cycles:
+            note = "waiting %s of the time it was inside a scope" % (
+                parallel.share_text(row.wait_cycles, row.busy_cycles),)
+        rows.append((
+            str(row.tid),
+            row.name or "-",
+            row.role or "other",
+            str(row.frames),
+            parallel.share_text(row.busy_cycles, report.span_cycles),
+            parallel.share_text(row.wait_cycles, report.span_cycles),
+            parallel.share_text(row.lock_cycles, report.span_cycles),
+            note,
+        ))
+    render_rows(
+        ("tid", "thread", "role", "frames", "busy", "wait", "lock", "note"),
+        rows,
+        (True, False, False, True, True, True, True, False),
         options.fmt(),
         lines,
     )
@@ -1581,6 +1680,7 @@ __all__ = [
     "cmd_timers",
     "cmd_frames",
     "cmd_bottleneck",
+    "cmd_parallelism",
     "cmd_summary",
     "cmd_tasks",
     "cmd_verify",

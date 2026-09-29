@@ -120,7 +120,7 @@ CsvTools pipeline (README §2):
   Value)`.
 
 Corpus state: the definitions are present, the per-frame events are not — `editor-pie-1` ran
-with the CSV profiler *registered* but no CSV capture active (README §2; ROADMAP §11 wants a
+with the CSV profiler *registered* but no CSV capture active (README §2; ROADMAP §9 wants a
 capture that has both). The engine's own reader of these events is
 `TraceServices\Private\Analyzers\CsvProfilerTraceAnalysis.cpp`, feeding the
 `CsvProfilerProvider` model.
@@ -162,36 +162,37 @@ specs, 27,760 timer specs (4,879 with file:line), 182 counter specs, session dur
 reproduce (`goldens/labels/editor-pie-1.json` pins them).
 
 Cost, measured in this working tree on this machine (2026-09-29, a cold `parse`, frame work
-attribution, occupancy and the GPU frame decode included — §10, §11):
+attribution, occupancy, the GPU frame decode and the coverage timelines with their per-frame
+measurement included — §10, §11, §13):
 
 | phase | serial | `--jobs 0` (the pool) |
 |---|---|---|
 | read the 34 MB file | 0.008 | 0.011 |
 | container header | 0.000 | 0.000 |
-| packets (163,600 headers) | 0.250 | 0.254 |
-| streams (LZ4: 24,767 blocks, 34.8 MB → 49.9 MB) | 0.651 | 0.671 |
-| model (the per-thread Python walk, all of the above) | 11.485 | 4.752 |
-| **cold full decode** | **12.39** | **5.69** |
+| packets (163,600 headers) | 0.251 | 0.290 |
+| streams (LZ4: 24,767 blocks, 34.8 MB → 49.9 MB) | 0.589 | 0.629 |
+| model (the per-thread Python walk, all of the above) | 15.493 | 7.931 |
+| **cold full decode** | **16.34** | **8.86** |
 
-A cached command is **0.23-0.29 s** (`summary` and `bottleneck` included: everything they report is
-in the cache, never re-derived from the streams) and `goldens --check` ~20 s over the three
-registered captures, whose transcripts are the pinned commands' real output. What a warm command
-spends its time on, measured 2026-09-29: **0.17 s interpreter and imports** (nothing this tool can
-avoid), **0.03 s** hashing the capture and **0.02 s** parsing the 3.35 MB cache, and -- before the
+A cached command is **0.32-0.33 s** (`summary`, `bottleneck` and `parallelism` included: everything
+they report is in the cache, never re-derived from the streams), the editor capture's cache is
+**6.74 MB** (3.35 MB before the coverage measurement landed) and `goldens --check` ~40 s over the
+three registered captures, whose transcripts are the pinned commands' real output. What a warm
+command spends its time on, measured 2026-09-29: **0.17 s interpreter and imports** (nothing this
+tool can avoid), **0.03 s** hashing the capture and **0.02 s** parsing the cache, and -- before the
 lazy packet walk below -- **0.25 s walking 163,600 packet headers on every command**, including the
 seven that never look at the table. That is why `CaptureView.packets` is a property: `info`,
 `packets`, `schema` and `verify` walk it, the model-based commands never pay for it.
 
 Three histories are in that table. The LZ4 half is the C library (§2): with the pure-Python decoder
 the same cold decode was **21.3 s**. The walk is per-thread work, so `--jobs` spreads it over
-processes — measured 2026-09-29 on the same capture: **12.99 / 7.54 / 5.99 / 6.00 / 5.99 / 6.04 /
-6.02 / 6.10 s** at 1 / 2 / 4 / 6 / 8 / 10 / 12 / 16 workers. It stops at the *biggest* thread rather
-than at the core count: tid 2 owns 53.4% of the corpus's 10,055,971 batch records, so the ceiling is
-that one thread and the curve is flat from 4 workers on (8 workers was 4.14 s before the occupancy
-landed, on the same shape of curve). `--jobs 0` (the default) caps its own choice at 8, while a
-capture whose work is spread evenly gets more of the box. The answer does not depend on `--jobs` at
-all: shares are merged by one function in ascending tid order, byte-for-byte into the cache's own
-format.
+processes — measured 2026-09-29 on the same capture, with the coverage work in place:
+**17.25 / 11.27 / 9.39 / 9.48 s** at 1 / 2 / 4 / 8 workers. It stops helping at four workers because
+two of its parts do not spread: tid 2 (53.4% of the corpus's 10,055,971 batch records) is one unit
+however many processes there are, and the frame measurement (§13) runs once, in the parent, over
+every thread's timeline. `--jobs 0` (the default) caps its own choice at 8, while a capture whose
+work is spread evenly gets more of the box. The answer does not depend on `--jobs` at all: shares
+are merged by one function in ascending tid order, byte-for-byte into the cache's own format.
 
 **What the attribution and occupancy cost.** Walking tid 2 alone — 5.49 M of those records, the
 biggest single unit — takes **3.28 s with nothing attributed and 4.24 s with the frame work and the
@@ -205,6 +206,18 @@ instead of two hashes for 2.5 M pairs) and answers the **disjoint** coverage cas
 paid once per capture, by the parse that fills the cache; a warm `summary`/`bottleneck` is 0.26/0.29 s
 like any other cached command, which is the whole reason the occupancy lives in the model rather than
 being recomputed by the report.
+
+**What the coverage timeline and the frame measurement add** (§13). The timeline is a second union
+over the same records, and the measurement folds the corpus's 779,431 intervals into its 2,826
+frames. Measured 2026-09-29: walking every thread with the timeline costs **12.7 s** against
+**11.5 s** without it (serial, +1.2 s), and the folding costs **2.40 s** — once, in the parent,
+whatever `--jobs` says, because it needs every thread's timeline at the same time and that is what
+makes it the parse's fixed part. A cold decode therefore went 5.69 → 8.86 s over the pool and
+12.39 → 16.34 s serial, the cache 3.35 → 6.74 MB, and it is paid by the parse that fills the cache
+once: `parallelism` itself is 0.33 s, like any other cached command. One change came out of
+measuring it: the folding subtracts a thread's wait intervals **per frame** instead of subtracting
+two long lists once (3.91 → 2.40 s), and the coverage union is a merge rather than a concurrency
+sweep, because nothing asks the union how many threads were inside it.
 
 **Where the remaining seconds are, and what was tried.** A profile of the serial parse (51.2 s under
 `cProfile`, ~3× real time) put `decode7bit` at the top with 15.08 M calls, then the walk's own loop,
@@ -259,7 +272,7 @@ A capture carries only what it was recorded with (`-trace=<id>,<id>...`; the mac
 channel are `UE_TRACE_CHANNEL*` in `Runtime\TraceLog\Public\Trace\Trace.h`). This is the inventory
 of what the engine can emit — gathered from the tree on 2026-09-28, grouped by the question it
 answers, with the engine analyser to mirror for field-level truth. **An absent channel is not a
-zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §7).
+zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §5).
 
 | Channel | Carries | Answers | Engine analyser to mirror |
 |---|---|---|---|
@@ -500,3 +513,89 @@ declares no flags, while every corpus event with a string field carries the flag
 written, the task *names* would need the aux read by another rule), and whether an editor or game
 capture's task count fits the table. The protocol above is pinned to the engine source; the
 fields, events and arithmetic are not guesses.
+
+## 13. The coverage timeline, and the parallelism report (`parallelism`)
+
+The practice's question after "what bounds this frame" is **"was the work spread?"** — Intel's loop
+puts *decide CPU/GPU/display-bound* before any drilling, and the CPU half of that decision is about
+occupancy: one thread working while the machine idles is a different problem from a saturated pool.
+`ueia parallelism` answers it from measurements the walk takes for every thread, not from scope
+names:
+
+* **Coverage**, per thread, is the union of the cycles it spent inside `CpuProfiler` scopes. The
+  walk records it as merged intervals — one per **outermost** span, because a nested scope closes
+  inside its parent, so the outermost ones *are* the union — and the same for the spans whose name
+  reads as a **wait** (`WaitForTasks` and friends) and as a **lock**. On the corpus's editor capture
+  that is 769,875 busy intervals, 240,201 wait intervals and 36,509 lock intervals across 131
+  threads; the game capture's RHI thread alone needs more than the cap below.
+* **`model.span_kind`** decides the split from the name: `"wait"` anywhere in it is a wait, and the
+  lock words (`lock`, `mutex`, `critical`, `semaphore`) are matched against the name's **camel-case
+  words**, not as a substring — `AllocateHeapBlock` is in the corpus's timer table, and a
+  case-insensitive `"lock" in name` reads it as one. 97 of the editor capture's 27,760 specs read as
+  locks, 6 of the game capture's 2,784.
+* **The timelines are bounded and the bound is counted.** A thread may keep
+  `coverage.SPAN_KEEP` (262,144) intervals per set; past that the walk *merges* what it sees into the
+  interval before it, which overstates coverage rather than dropping it — the safe direction for a
+  parallelism claim — and counts the spans it swallowed (`counts["spans_coarsened"]`, and
+  `thread_spans[].coarsened` so a table can name the row). The corpus's worst *uncoarsened* thread
+  needs 120,846; the game capture's RHI thread exceeds the cap by 32,649 spans.
+* **The timelines do not go in the cache.** They are packed (`coverage.pack`, u64) because a share is
+  pickled between processes, and they are dropped after the measurement: what the model keeps is the
+  answer (`thread_spans`, `frame_occupancy`), which is bounded by threads and frames rather than by
+  spans. Those rows are what the cache grew for: the editor capture's 2,826 frame rows are **3.6 MB**
+  of its **6.74 MB** cache (measured: 3.62 MB of a 7.44 MB pretty-printed document, against 3.40 MB
+  for everything else the model holds).
+
+**The measurement**: `coverage.measure_frames` folds every thread's timeline into every frame the
+capture recorded (`Misc.BeginFrame`/`EndFrame` pairs, of every thread — a worker pool has no frames
+of its own, so its occupancy only means something against somebody else's). Each frame row carries:
+
+| column | what it is |
+|---|---|
+| `threads[]` | per thread: `busy_cycles`, `wait_cycles`, `lock_cycles` inside that window |
+| `solo_cycles` | the frame's own thread **working** (busy minus wait) with no *other* thread working at the same cycle |
+| `others_work_cycles` | the union of the other threads' work in the window (their overlaps counted once) |
+| `all_cycles` | the union of every thread's coverage, waiting included, so `span - all_cycles` is time no thread was inside any scope at all |
+| `peak_workers` | the most threads working at the same cycle — **work**, not coverage: a thread inside `WaitForTasks` is not one of them |
+| `contended_cycles` | cycles two or more threads spent inside lock-named scopes together |
+
+`solo_cycles` is the number the report's argument rests on, and it is deliberately *overlap*, not
+dependency: two scopes that merely touch are not an overlap (`sweep` orders an end before a begin at
+the same cycle), and the report says in the same line that a scope beside another is not a dependency
+— what it does *not* say is that the solo work could have been spread.
+
+**What the report prints, and what it refuses to claim.** The table is per thread over the series'
+own span (busy/wait/lock percentages, plus why a row is worth reading); the prose carries the
+occupancy split, the solo share, the frames that miss the budget with their own solo share, the
+histogram of `peak_workers`, the lock overlap and the candidates. Three rules are visible in the
+wording:
+
+* **A ceiling is a heuristic.** The Amdahl figure is computed from the *measured* solo share over the
+  thread count a frame usually has working, printed as a *ceiling* ("would cut the work to 25.0%"),
+  never as a prediction.
+* **The typical frame, not the best one.** The thread count in that ceiling is the **commonest**
+  `peak_workers`, not the maximum: one startup frame where sixty threads run at once would otherwise
+  turn "the machine was idle" into "the machine was full". The maximum is still printed, named as
+  such.
+* **No core count, no oversubscription verdict.** A `.utrace` does not record how many cores the
+  machine had, so the report says so and stops there rather than guessing from the thread count.
+  Contention is the same shape: it is the overlap of the names that read as locks, and a lock called
+  something else is invisible — said out loud, because "not measured" is not "none".
+
+**What the corpus shows** (`ueia parallelism --budget 60`, pinned as golden transcripts):
+
+| capture | series | solo work | peak workers (commonest / most) | locks | verdict |
+|---|---|---|---|---|---|
+| `editor-pie-1` | tid 2, 1,413 frames, 217.200 s | **93.0%** (201.325 s of 216.493 s) | 5 / 60 | 42 frames, 0.162 ms | an editor thread working alone: its render and RHI threads are inside scopes 100% of the frames and *waiting* 98.5% / 97.0% of that |
+| `game-pc-2` | tid 2, 771 frames, 40.121 s | **69.6%** (1.257 s of 1.806 s) | 23 / 63 | none | a game spreading its work: the other threads do 24.9% of the span's work beside a frame thread that is itself waiting 95.5% of the time |
+| `viewer-pc-3` | none | — | — | — | **exit 2**: no `Misc.BeginFrame` pair to measure against |
+
+The editor capture's candidate line names `UEditorEngine::StartPlayInEditorSession` (90% of the 16
+frames the model keeps work for), which is the honest shape of that answer: a **sample** of the
+thread's worst frames (`model._FRAME_WORK_KEEP`) plus a **name heuristic** that skips scopes already
+called `Parallel*`/`Task*`/`Async*`, both said in the line itself. What a capture cannot show is
+whether that scope *could* be split — which is why the ceiling, not the candidate, is the part of
+this report a reader is meant to act on.
+
+Cost: §6 — the timeline is ~1.2 s of the walk and the folding is 2.40 s of a cold parse, once per
+capture; a warm `parallelism` is 0.33 s.

@@ -34,7 +34,7 @@ is longest -- `MaxChainDuration + (Finished - Started)`, recursively. It adds no
 what it answers is "if this chain could not be shorter, the frame could not be faster", and a gap
 between two tasks of the chain is a scheduling artefact, drawn as an edge rather than summed.
 
-Two rules this module keeps, both from ROADMAP §1 and the repo's standing rules:
+Two rules this module keeps, both from the repo's standing rules (AGENTS.md, README §4):
 
 * **Absent is not zero.** A capture with no `TaskTrace` events is *exit 2 with the re-record line*
   (`-trace=cpu,frame,...,task`), never an empty path and never a guess.

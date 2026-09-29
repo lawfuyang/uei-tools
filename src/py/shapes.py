@@ -13,10 +13,12 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, TypedDict
 TOOL_NAME = "ueia"
 #: 0.2.0 added `frame_work` to the model (the per-frame work attribution the summary reports).
 #: 0.3.0 added the frame occupancy (`covered_cycles`/`wait_cycles`), the decoded GPU frames and the
-#: GPU specs -- the bottleneck verdict's inputs. The cache is keyed by this string, so the bump is
-#: what stops a model built by an older version, which has none of those, from being read back and
-#: reported as a capture that had no occupancy and no GPU work.
-TOOL_VERSION = "0.3.0"
+#: GPU specs -- the bottleneck verdict's inputs. 0.4.0 added the per-thread coverage timelines'
+#: measurement (`thread_spans`, `frame_occupancy`): who was working inside each frame, and for how
+#: long, which is what the parallelism report reads. The cache is keyed by this string, so the bump
+#: is what stops a model built by an older version, which has none of those, from being read back
+#: and reported as a capture where no other thread ever worked.
+TOOL_VERSION = "0.4.0"
 CACHE_FORMAT = 1
 
 MAGIC = b"2CRT"
@@ -344,6 +346,61 @@ class FrameWorkRow(TypedDict):
     cycles: int
     pairs: int
     items: List[Tuple[int, int]]
+
+
+class ThreadSpanRow(TypedDict):
+    """One thread's whole-timeline coverage, as the walk measured it.
+
+    `spans` counts the **outermost** spans kept -- one interval each, because nested scopes close
+    inside theirs, so a thread's coverage timeline is exactly this list. The three cycle columns are
+    the same split the frames use (`FrameRow.covered_cycles`/`wait_cycles`) plus the lock-named
+    scopes a contention question needs; a thread whose timeline the walk had to coarsen at
+    `coverage.SPAN_KEEP` says so in the walk's `spans_coarsened` counter, and the coverage here is
+    then an overstatement, never a silence.
+    """
+
+    tid: int
+    spans: int
+    coarsened: int
+    busy_cycles: int
+    wait_cycles: int
+    lock_cycles: int
+
+
+class FrameThreadRow(TypedDict):
+    """One thread's coverage inside one frame window: the occupancy table's raw row."""
+
+    tid: int
+    busy_cycles: int
+    wait_cycles: int
+    lock_cycles: int
+
+
+class FrameOccupancyRow(TypedDict):
+    """What every thread did inside one frame -- the parallelism report's measurement.
+
+    One row per frame, in the model's frame order (`frame` is its index there), because the windows
+    are the capture's own `Misc.BeginFrame` pairs and *every* thread is measured against them: a
+    worker pool has no frames of its own, so its occupancy only means something against somebody
+    else's.
+
+    `solo_cycles` is the frame's own thread **working** (inside a scope that is not a wait) while no
+    other thread was working -- the serial time a parallelism argument is about, measured rather than
+    guessed. `others_work_cycles` is the union of the other threads' work in the window, `all_cycles`
+    the union of every thread's coverage (waiting included, so `span - all_cycles` is time no thread
+    was inside any scope at all), `peak_workers` the most threads working at the same cycle, and
+    `contended_cycles` the cycles two or more threads spent inside lock-named scopes at once. Every
+    one of those is a *measurement*; whether any of it was parallelisable is a report's heuristic.
+    """
+
+    frame: int
+    tid: int
+    threads: List["FrameThreadRow"]
+    solo_cycles: int
+    others_work_cycles: int
+    all_cycles: int
+    peak_workers: int
+    contended_cycles: int
 
 
 class GpuSpecRow(TypedDict):

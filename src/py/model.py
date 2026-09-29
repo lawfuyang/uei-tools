@@ -17,8 +17,10 @@ whatever could not be decoded is counted rather than guessed at.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict
 
+import coverage
 import decode
 import events
 import gpu
@@ -33,6 +35,7 @@ from shapes import (
     CounterSpecRow,
     CsvStatRow,
     EventTypeRow,
+    FrameOccupancyRow,
     FrameRow,
     FrameWorkRow,
     GpuFrameRow,
@@ -46,6 +49,7 @@ from shapes import (
     TaskStepRow,
     TaskWaitRow,
     ThreadRow,
+    ThreadSpanRow,
     TimerRow,
     UeiaError,
 )
@@ -57,6 +61,27 @@ MAX_ANOMALY_SAMPLES = 20
 #: a heuristic on the capture's own vocabulary -- the engine names its waits `WaitFor*` (`WaitForTasks`,
 #: `WaitForGPU`, `WaitUntilTasksComplete`, `WaitForRHIThread`) -- and reports that use it say so.
 WAIT_NAME_MARKERS = ("wait",)
+
+#: Words that mark a scope as a **lock**: work spent acquiring something shared, where the question
+#: is contention rather than duration (`FScopeLock`, `AcquireGCLock`, `FD3D12FastAllocator::Lock`,
+#: `FCriticalSection`, `FMutex`). Matched against the name's camel-case words rather than as a
+#: substring, because `AllocateHeapBlock` -- a real name in the corpus's timer table -- ends in
+#: "Block", and a case-insensitive `"lock" in name` reads that as a lock. 97 of the corpus's 27,760
+#: specs match (REFERENCE §6); like every name rule here, it is a heuristic and reports say so.
+LOCK_NAME_WORDS = frozenset(("lock", "locks", "locked", "unlock", "mutex", "critical", "semaphore"))
+_SPAN_WORD_RE = re.compile(r"[A-Z][a-z]+")
+
+
+def span_kind(name: str) -> int:
+    """How a scope's name reads: work, a wait, or a lock (see `WAIT_NAME_MARKERS`, `LOCK_NAME_WORDS`)."""
+    lowered = name.lower()
+    for marker in WAIT_NAME_MARKERS:
+        if marker in lowered:
+            return coverage.SPAN_WAIT
+    for word in _SPAN_WORD_RE.findall(name):
+        if word.lower() in LOCK_NAME_WORDS:
+            return coverage.SPAN_LOCK
+    return coverage.SPAN_WORK
 
 #: How many of a thread's longest frames keep their work attribution (`FrameWorkRow`), and how many
 #: timer specs each of those rows names. Sixteen frames is more than any report lists (the summary's
@@ -108,6 +133,10 @@ _COUNTS_KEYS = (
     "gpu_specs",
     # the task channel: the events themselves (the graph is built once, after the merge)
     "task_events",
+    # the coverage timelines: the outermost spans kept per thread, and the spans a per-thread cap had
+    # to coarsen (counted, never dropped silently -- REFERENCE §6)
+    "scope_spans",
+    "spans_coarsened",
 )
 
 
@@ -158,6 +187,8 @@ class SessionModel(TypedDict):
     timers: List[TimerRow]
     frames: List[FrameRow]
     frame_work: List[FrameWorkRow]
+    thread_spans: List[ThreadSpanRow]
+    frame_occupancy: List[FrameOccupancyRow]
     gpu_specs: List[GpuSpecRow]
     gpu_frames: List[GpuFrameRow]
     tasks: List[TaskRow]
@@ -257,6 +288,13 @@ class ThreadShare(TypedDict):
     anomalies: List[Anomaly]
     frames: List[FrameRow]
     frame_work: List[FrameWorkRow]
+    # the coverage timelines, packed (`coverage.pack`): one `bytes` per set, so the share stays small
+    # on the wire and the parent only expands the ones it measures
+    spans: bytes
+    wait_spans: bytes
+    lock_spans: bytes
+    #: how many spans of this thread's timeline the per-thread cap had to merge (`coverage.SPAN_KEEP`)
+    spans_coarsened: int
     gpu_frames: List[GpuFrameRow]
     task_events: List[TaskEventRow]
     bookmarks: List[BookmarkRow]
@@ -431,9 +469,9 @@ def _walk_tid(
     is small enough to send back. It keeps the counters it wrote, so `_merge_share` is the only
     place where two threads meet.
 
-    `specs` (one flag per timer spec the capture declared, `b"\x01"` when the spec's name reads as a
-    wait like `WaitForTasks`; None when it declared none) turns on the frame attribution and
-    occupancy. Two passes: `_pair_windows` collects this thread's frame windows, then this loop
+    `specs` (one kind per timer spec the capture declared -- work, wait like `WaitForTasks`, or lock;
+    None when it declared none) turns on the frame attribution, the occupancy and the **coverage
+    timeline**. Two passes: `_pair_windows` collects this thread's frame windows, then this loop
     attributes every scope pair of every batch to the window whose span contains the pair's **end**
     cycle, clipped to that window, and merges it into the window's occupancy -- cycles inside any
     scope, and cycles inside a wait-named one, which is the difference between a thread that is
@@ -441,6 +479,14 @@ def _walk_tid(
     (`scope_pairs_spanning`); one that ended in no window at all is counted too
     (`scope_pairs_unframed` -- which is also every pair of a thread that has no frames at all),
     never guessed into the nearest frame.
+
+    The same records also build the thread's **coverage timeline**: the union of every span it held
+    (one interval per *outermost* span, because a nested scope closes inside its parent), and the
+    same for the wait-named and lock-named ones. Frames are not involved -- a worker pool has no
+    frames of its own, and its occupancy only means something against another thread's windows -- so
+    the timeline is folded into the frames later, once every thread has been walked
+    (`coverage.measure_frames`). The lists are packed (`coverage.pack`) because they cross a process
+    boundary and outlive the walk.
 
     The **work** (the big specs by clipped cycles) is kept for the thread's longest frames only
     (`_FRAME_WORK_KEEP`), which pass 1 makes possible: their lengths are known before a single
@@ -485,6 +531,21 @@ def _walk_tid(
     no_spec = 0
     unframed = 0
     ends_unpaired = 0
+    # the coverage timeline, in the loop's own locals for the same reason: flat [begin, end, ...]
+    # lists, one per kind, plus the depths that say when a wait or a lock is open at all. `busy`
+    # opens on the span that finds the stack empty and closes when it empties again -- which *is* the
+    # union of every span, since a nested one lives inside its parent.
+    busy: List[int] = []
+    waits: List[int] = []
+    locks: List[int] = []
+    busy_begin = 0
+    wait_begin = 0
+    lock_begin = 0
+    wait_depth = 0
+    lock_depth = 0
+    kinds = specs if specs is not None else b""
+    kind_count = len(kinds)
+    coarsened = 0
     for event in events.iter_thread_events(stream, tid, registry, anomalies, counts):
         if event.b_scope:
             continue
@@ -540,12 +601,55 @@ def _walk_tid(
                 if not occupancy_on:
                     continue
                 if is_begin:
+                    if not stack:
+                        busy_begin = cycle
                     stack.append((spec_id, cycle))
+                    kind = kinds[spec_id] if spec_id is not None and spec_id < kind_count else 0
+                    if kind == coverage.SPAN_WAIT:
+                        if not wait_depth:
+                            wait_begin = cycle
+                        wait_depth += 1
+                    elif kind == coverage.SPAN_LOCK:
+                        if not lock_depth:
+                            lock_begin = cycle
+                        lock_depth += 1
                     continue
                 if not stack:
                     ends_unpaired += 1
                     continue
                 spec, begin = stack.pop()
+                kind = kinds[spec] if spec is not None and spec < kind_count else 0
+                if kind == coverage.SPAN_WAIT:
+                    wait_depth -= 1
+                    if wait_depth <= 0:
+                        if cycle > wait_begin:
+                            if len(waits) < coverage.SPAN_KEEP * 2:
+                                waits.append(wait_begin)
+                                waits.append(cycle)
+                            else:
+                                waits[-1] = cycle
+                                coarsened += 1
+                        wait_depth = 0
+                elif kind == coverage.SPAN_LOCK:
+                    lock_depth -= 1
+                    if lock_depth <= 0:
+                        if cycle > lock_begin:
+                            if len(locks) < coverage.SPAN_KEEP * 2:
+                                locks.append(lock_begin)
+                                locks.append(cycle)
+                            else:
+                                locks[-1] = cycle
+                                coarsened += 1
+                        lock_depth = 0
+                if not stack and cycle > busy_begin:
+                    # the outermost span closed: one interval of coverage, or -- past the cap -- the
+                    # one before it, extended (coverage overstated rather than dropped, and counted)
+                    if len(busy) < coverage.SPAN_KEEP * 2:
+                        busy.append(busy_begin)
+                        busy.append(cycle)
+                    else:
+                        busy[-1] = cycle
+                        coarsened += 1
                 # the window whose span holds this pair's end: the cursor only ever moves forward,
                 # because pairs are popped in end order
                 while cursor < window_count and windows[cursor].end < cycle:
@@ -587,8 +691,8 @@ def _walk_tid(
                         if cycle > cover_end:
                             covered += cycle - (begin if begin > cover_end else cover_end)
                             cover_end = cycle
-                    if (spec is not None and spec < spec_count and specs[spec]
-                            and cycle > wait_end):
+                    if (spec is not None and spec < spec_count
+                            and kinds[spec] == coverage.SPAN_WAIT and cycle > wait_end):
                         if wait_end < wait_start:
                             waiting = span
                             wait_start = begin
@@ -709,6 +813,8 @@ def _walk_tid(
         counts["scope_pairs_unframed"] += unframed
         counts["scope_ends_unpaired"] += ends_unpaired
         counts["scope_begins_unpaired"] += len(stack)
+        counts["scope_spans"] += len(busy) // 2
+        counts["spans_coarsened"] += coarsened
     frame_rows = [window.frame_row(tid, occupancy_on) for window in windows]
     frame_work = [window.work_row(tid, _FRAME_WORK_TOP) for window in windows
                   if window.totals is not None]
@@ -716,6 +822,8 @@ def _walk_tid(
     return ThreadShare(
         tid=tid, row=trow, counts=counts, uid_counts=uid_counts, counter_values=counter_values,
         region_counts=region_counts, anomalies=anomalies, frames=frame_rows, frame_work=frame_work,
+        spans=coverage.pack(busy), wait_spans=coverage.pack(waits), lock_spans=coverage.pack(locks),
+        spans_coarsened=coarsened,
         gpu_frames=gpu_frames, task_events=task_events, bookmarks=bookmarks,
     )
 
@@ -759,21 +867,19 @@ def _merge_share(acc: "ModelAcc", share: ThreadShare) -> None:
     acc["bookmarks"].extend(share["bookmarks"])
 
 
-def _spec_flags(timers: Dict[int, TimerRow]) -> Optional[bytes]:
-    """One byte per timer spec: 1 when the spec's name reads as a wait, 0 when it does not.
+def _spec_kinds(timers: Dict[int, TimerRow]) -> Optional[bytes]:
+    """One byte per timer spec: how its name reads (`coverage.SPAN_WORK/WAIT/LOCK`).
 
     The array doubles as the attribution switch -- its length is one past the highest spec id the
-    capture declared, and None (no specs at all) turns the frame attribution and the occupancy off,
-    because a capture that declared no timer specs has nothing to attribute.
+    capture declared, and None (no specs at all) turns the frame attribution, the occupancy and the
+    coverage timelines off, because a capture that declared no timer specs has nothing to attribute.
     """
     if not timers:
         return None
-    flags = bytearray(max(timers) + 1)
+    kinds = bytearray(max(timers) + 1)
     for spec_id, row in timers.items():
-        name = str(row["name"]).lower()
-        if any(marker in name for marker in WAIT_NAME_MARKERS):
-            flags[spec_id] = 1
-    return bytes(flags)
+        kinds[spec_id] = span_kind(str(row["name"]))
+    return bytes(kinds)
 
 
 def _worker_init(registry: schema.SchemaRegistry,
@@ -1036,10 +1142,11 @@ def build_model(
         for tid in sorted(stream_set.streams)
         if tid not in (TID_EVENTS, TID_IMPORTANTS)
     ]
-    # one flag per timer spec, one past the highest id the capture declared: the array a frame's
-    # totals are counted in, and which of the specs read as a wait. None (no specs at all) is what
-    # turns the frame attribution off, so an unattributable capture still walks its frames.
-    specs = _spec_flags(timers)
+    # one kind per timer spec, one past the highest id the capture declared: the array a frame's
+    # totals are counted in, and which of the specs read as a wait or a lock. None (no specs at all)
+    # is what turns the frame attribution and the coverage timelines off, so an unattributable
+    # capture still walks its frames.
+    specs = _spec_kinds(timers)
     workers = _workers_for(units, jobs)
     if workers > 1:
         shares = _parallel_shares(registry, units, bookmark_specs, workers, specs)
@@ -1073,6 +1180,18 @@ def build_model(
         int(row["begin_cycle"]), int(row["tid"]), int(row["type"]),
     ))
     bookmarks.sort(key=lambda row: (int(row["cycle"]), int(row["point"])))
+
+    # -- what every thread did inside every frame: the timelines the walks measured, folded into the
+    # capture's own frame windows. Here, once, because a worker pool has no frames of its own and a
+    # per-thread walk cannot see another thread's -- and the timelines are *not* kept past this point
+    # (a capture's 1.05 M intervals have no business in a JSON cache, REFERENCE §6 and §13).
+    thread_spans, frame_occupancy = coverage.measure_frames(
+        frame_rows,
+        {share["tid"]: (share["spans"], share["wait_spans"], share["lock_spans"])
+         for share in shares},
+        {share["tid"]: int(share["spans_coarsened"]) for share in shares},
+    )
+    del shares
 
     last_cycle = 0
     for trow in threads.values():
@@ -1121,6 +1240,8 @@ def build_model(
         frames=frame_rows,
         frame_work=frame_work,
         gpu_specs=[gpu_specs[spec_id] for spec_id in sorted(gpu_specs)],
+        thread_spans=thread_spans,
+        frame_occupancy=frame_occupancy,
         gpu_frames=sorted(gpu_frames, key=lambda row: (
             int(row["base_us"]), int(row["number"]), int(row["tid"]),
         )),

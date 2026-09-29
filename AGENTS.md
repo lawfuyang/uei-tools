@@ -11,7 +11,7 @@ Any change to `src/py/` or `tests/` is not finished until all three pass:
 
 ```powershell
 python src\py\ueia.py lz4 --build       # step 0: bin/ueia_lz4.dll, built only when stale
-python src\py\ueia.py selftest          # the hermetic suite: ~30 s, exit 0 pass / 1 fail / 2 bad option
+python src\py\ueia.py selftest          # the hermetic suite: ~80 s (the corpus half dominates), exit 0 pass / 1 fail / 2 bad option
 npx --yes pyright@latest                # must print: 0 errors, 0 warnings
 python src\py\ueia.py goldens --check   # the corpus: exit 0 matched / 1 a problem / 2 nothing to compare
 ```
@@ -44,12 +44,15 @@ the entry point is `ueia.py`, so a module's name is its job, not its owner.
 loader rather than a decoder of our own, `gpu` decodes the legacy `GpuProfiler` channel's
 per-frame batches) → `container` (header + packet walk) → `streams` (per-thread streams)
 → `events` (framing: records, events, aux, scopes) → `schema` (the vocabulary) → `decode`
-(values + the batch format) → `model` (the session model, incl. the per-frame work attribution
-and occupancy) → `summary` (the budget, percentiles and histograms a frame-time report is
-defined by) → `bottleneck` (the classification on top of them: what bounds a frame) → `tasks`
-(the task channel's graph, its critical path, and the DOT/Mermaid exports) → `cache`
-(the parse cache) → `goldens` (the corpus harness) → `commands` (the commands and their
-rendering) → `ueia.py` (the CLI, which re-exports them all for scripts and tests).
+(values + the batch format) → `coverage` (cycle-interval arithmetic, and the per-frame occupancy
+measurement every thread's timeline is folded into) → `model` (the session model, incl. the
+per-frame work attribution, the occupancy and the coverage timelines) → `summary` (the budget,
+percentiles and histograms a frame-time report is defined by) → `bottleneck` (the classification
+on top of them: what bounds a frame) → `parallel` (the same measurements, asked who worked: solo
+work, simultaneity, contention) → `tasks` (the task channel's graph, its critical path, and the
+DOT/Mermaid exports) → `cache` (the parse cache) → `goldens` (the corpus harness) → `commands`
+(the commands and their rendering) → `ueia.py` (the CLI, which re-exports them all for scripts
+and tests).
 
 Two names are deliberately *not* the obvious ones, and the reasons are measured:
 `types.py` is impossible — the interpreter preloads the stdlib `types`, so `import types` would
@@ -115,7 +118,7 @@ without `gpu` cannot answer a GPU question, one without `memtag`/`memalloc` cann
 question, and one without `task` cannot show a critical path. An analysis whose channel is missing
 reports **skipped** with the re-record line, never zero, never a default and never a guess — the
 same rule as the corpus half's exit 2, one level down. Every analysis that lands says in its tests
-what it does with its channel absent, and `coverage` (ROADMAP §7) is the one command that has to
+what it does with its channel absent, and `coverage` (ROADMAP §5) is the one command that has to
 get this right for all of them at once.
 
 ## Parallel work (the one place processes are used)
@@ -212,6 +215,14 @@ suite's real numbers — test count, pass/fail, pyright errors — not "passes".
   The same rule covers the attribution's leftovers: a scope pair that could not be attributed is
   *counted* (`scope_pairs_spanning`, `scope_pairs_no_spec`, the unpaired ends and begins), and
   `verify` prints those counts — a gap in a report is a number, not silence.
+* **A measurement is not a recommendation.** `ueia parallelism` reports what it measured (solo
+  cycles, peaks, lock overlap) and marks every *ceiling* it derives as Amdahl on that measurement,
+  because "this work had nobody beside it" is a fact and "this work could be spread" is not. Two
+  consequences the code keeps: the ceiling is built on the **commonest** frame's thread count, never
+  the maximum (one startup frame where 60 threads run at once would turn an idle machine into a full
+  one), and an absent input stays absent — a capture records no core count, so oversubscription is
+  "cannot be judged here", and a lock whose name the heuristic does not recognise is "invisible",
+  never "no contention". The same shape as the bottleneck's rule about a missing GPU channel.
 * **One machine, offline.** No network, no device, no live connections — see ROADMAP's not-list
   before proposing work that needs one.
 
@@ -246,8 +257,9 @@ mode, zero errors and zero warnings.
 
 * Docs: `README.md` (setup, corpus, CsvTools reuse, the playbook), `REFERENCE.md` (the capture
   format, decoded: container, packets, event streams, schema incl. the CSV Profiler's events,
-  the engine file map, corpus measurements, and §10's definitions of what a frame-time report
-  means by a frame, a percentile, a hitch and "what ran in it"), `ROADMAP.md` (build order,
+  the engine file map, corpus measurements, §10's definitions of what a frame-time report
+  means by a frame, a percentile, a hitch and "what ran in it", §11's bottleneck verdict, §12's
+  task graph and §13's coverage timeline with the parallelism report it feeds), `ROADMAP.md` (build order,
   P-labels, scope, the not-list — landed items are removed, cross-references updated in the same
   change), `AGENTS.md` (this file).
 * Nothing that belongs to one machine's working tree is committed — local state (the parse

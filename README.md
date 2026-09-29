@@ -105,7 +105,7 @@ CSV Profiler-format `.csv` first — the channel carries the stat definitions
 (`RegisterCategory`, `DefineDeclaredStat`, `DefineInlineStat`) and, when a CSV capture was
 running, the per-frame values too (`BeginStat`/`EndStat`/`CustomStat`/`Event`/`Metadata`, see
 `REFERENCE.md`). The corpus capture has the definitions but no per-frame CSV events — a capture
-with a CSV capture running is wanted (the `from-trace` bridge above, and ROADMAP §11).
+with a CSV capture running is wanted (the `from-trace` bridge above, and ROADMAP §9).
 
 ## 3. What the engine already answers (and this tool does not rebuild)
 
@@ -148,6 +148,7 @@ three). Commands that need engine-provided tooling will take `--engine-dir` (or 
 | `frames <capture> [--limit N]` | `Misc.BeginFrame`/`EndFrame` pairs per thread and frame type, in cycles and seconds since the trace started |
 | `tasks <capture> [--limit N] [--graph dot\|mermaid\|json]` | the task graph and the longest dependency chain through it: how many tasks and edges the capture carries, the chain's total executing time with every step's duration, thread and frame, the per-thread waiting spans, and (`--graph`) the graph itself for a viewer or a PR comment. Exit 2 when the capture carries no `TaskTrace` events, with the re-record line — never an empty path |
 | `bottleneck <capture> [--budget FPS \| --budget-ms MS] [--tid N] [--limit N]` | what bounds a frame: the **game thread**, the **render thread**, the **GPU**, or none of them. Every verdict is a measurement against the budget (the thread's own non-wait scope coverage, the sibling thread's coverage inside the same frame, the GPU's busy time when the capture carries the legacy GPU channel), with the evidence that decided it and the reasons it cannot decide. A capture with no GPU channel gets its CPU finding *plus* "the GPU side is unknown here", never a bare CPU-bound claim. Exit 0 classified / 2 nothing to judge (no frame pairs, no cycle frequency, no scopes) |
+| `parallelism <capture> [--budget FPS \| --budget-ms MS] [--tid N] [--limit N]` | was the work spread? Per thread: busy / waiting / lock-named cycles inside the frame series' own frames, the frame thread's **solo** work (measured overlap, not a dependency claim), the most threads working at once, lock overlap and the timers that own a quarter of the frames the model keeps — every ceiling Amdahl on a measure and labelled a heuristic, every absence (no core count, a lock nobody named) said out loud. Exit 0 reported / 2 nothing to measure (no frames, no cycle frequency, no scopes) |
 | `summary <capture> [--budget FPS \| --budget-ms MS] [--tid N] [--limit N]` | is this capture fast? The frame-time **distribution** (mean/min/p50/p95/p99/max + a histogram) against an explicit budget (60 FPS by default) with a verdict, a **hitch count**, the one-line bottleneck verdict above, and the frames that break the budget — worst first, each naming the timers that ran in it. Exit 0 reported / 2 nothing to time (no frame pairs, or no cycle frequency) — being over budget is the report, not a failure |
 | `verify <capture> [--jobs N]` | walks everything and reports what does not add up: packet and stream anomalies, schema redefinitions, serial gaps, unpaired frames, unknown bookmark points. **Exit 1** when anything error-level was found |
 | `parse <capture> [--jobs N]` | builds (and caches) the session model; prints what it holds |
@@ -159,18 +160,19 @@ three). Commands that need engine-provided tooling will take `--engine-dir` (or 
 
 The parse cache sits beside the capture, keyed by its SHA-256 and the tool version, and never
 changes an answer — only the seconds a command takes: measured on the corpus (2026-09-29), a cold
-full decode is 5.69 s (the LZ4 half, in the C library, is 0.65 s of it, the per-thread walk runs
-over worker processes, and attributing each frame's work and occupancy costs ~1 s of it) and a
-cached command **0.23-0.29 s** — of which 0.17 s is interpreter startup, and the rest is hashing the
-capture (0.03 s) and parsing the cache (0.02 s), because the packet table is only walked by the
-commands that print it. `--jobs N` sets how many processes that walk may use — any command that has
-to build the model — and `--jobs 0` (the default) chooses for the machine. It cannot change a byte
-of the output; the suite pins serial ≡ parallel.
+full decode is 8.86 s (the LZ4 half, in the C library, is 0.63 s of it, the per-thread walk runs
+over worker processes, attributing each frame's work and occupancy costs ~1 s and measuring every
+thread's occupancy inside every frame — the coverage timelines §4's `parallelism` reads — 2.4 s more)
+and a cached command **0.32-0.33 s** — of which 0.17 s is interpreter startup, and the rest is
+hashing the capture (0.03 s) and parsing the cache (0.02 s), because the packet table is only walked
+by the commands that print it. `--jobs N` sets how many processes that walk may use — any command
+that has to build the model — and `--jobs 0` (the default) chooses for the machine. It cannot change
+a byte of the output; the suite pins serial ≡ parallel.
 
-Planned (see `ROADMAP.md`): the timer **call tree** and self time, parallelism findings from the
-occupancy the model already measures, source mapping, a `coverage` command that says whether a
-capture can answer a question at all, GPU / memory / loading / stats-channel analyses, the
-recommendations engine, and `compare` as a CI gate with p99 thresholds and rolling baselines.
+Planned (see `ROADMAP.md`): the timer **call tree** and self time, source mapping, a `coverage`
+command that says whether a capture can answer a question at all, GPU / memory / loading /
+stats-channel analyses, the recommendations engine, and `compare` as a CI gate with p99 thresholds
+and rolling baselines.
 
 Output philosophy for those: every report carries a `meta` block (tool version, input hashes,
 engine and protocol version detected, engine-dir path as configured, analysis duration,

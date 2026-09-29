@@ -353,6 +353,100 @@ def work_importants() -> bytes:
     )
 
 
+def parallel_schema() -> bytes:
+    """`work_schema` plus a second thread's scopes: the vocabulary a parallelism report needs."""
+    return work_schema()
+
+
+def parallel_importants() -> bytes:
+    """Four specs (work, wait, worker work, lock) and two named threads.
+
+    `FrameTime` and `WaitForTasks` are `work_importants`' own; `WorkerTask` and `FScopeLock` are the
+    second thread's. `FScopeLock`'s name is what `model.span_kind` reads as a **lock** -- and the
+    camel-case test is why: `FScopeLock` has a `Lock` word, `Block` would not.
+    """
+    return (
+        work_importants()
+        + important_record(17, pack("u32", 4) + important_aux_block(1, b"WorkerThread"))
+        + important_record(20, pack("u32", 10) + pack("u32", 77)
+                           + important_aux_block(1, b"WorkerTask")
+                           + important_aux_block(2, b"Work.cpp"))
+        + important_record(20, pack("u32", 11) + pack("u32", 12)
+                           + important_aux_block(1, b"FScopeLock")
+                           + important_aux_block(2, b"Lock.cpp"))
+    )
+
+
+def parallel_records(records: Sequence[Tuple[int, Optional[int], bool]]) -> bytes:
+    """One batch event per scope record, `(absolute cycle, spec or None, is-begin)`.
+
+    The wire is delta-encoded -- the walk reads `cycle = delta` and adds the last cycle when the
+    delta is smaller, which is how the engine's own writer keeps a record to a byte or two -- so this
+    helper emits the distances, in the order the records are given (the order *is* the nesting: a
+    nested scope's begin comes before the closing record of the scope around it).
+    """
+    out = b""
+    previous = 0
+    for cycle, spec, is_begin in records:
+        payload = varint(((cycle - previous) << 2) | (1 if is_begin else 0))
+        if is_begin and spec is not None:
+            payload += varint(spec)
+        out += event(21, b"", aux=[(0, payload)], maybe_aux=True)
+        previous = cycle
+    return out
+
+
+def parallel_streams() -> Dict[int, bytes]:
+    """Two threads whose work overlaps, with every number hand-checkable at 1 cycle = 1 microsecond.
+
+    The game thread (tid 2) runs two frames: 20 ms from cycle 1,000,000 and 40 ms from 1,020,000. In
+    the first it works 12 ms -- `FrameTime` from 1,002,000 to 1,018,000, with 4 ms of `WaitForTasks`
+    inside it (1,010,000 to 1,014,000) and 2 ms of `FScopeLock` inside it too (1,014,000 to 1,016,000)
+    -- and in the second it works 8 ms alone (1,022,000 to 1,030,000).
+
+    The worker (tid 4) works 7 ms *beside* it (1,005,000 to 1,012,000) and takes a lock-named scope
+    for 2 ms (1,015,000 to 1,017,000) while the game thread is inside one. Over the two frames, then:
+    the game thread's work is 12 + 8 = 20 ms, of which 5 + 8 = 13 ms has no other thread working; the
+    worker's work is 9 ms; the union of every thread's coverage is 16 + 8 = 24 ms of the 60 ms of
+    frames; two threads work at once in the first frame and one in the second; and 1 ms of lock-named
+    scope is held by two threads at once. `test_parallel` pins those numbers against the report and
+    `test_coverage` pins the interval arithmetic behind them.
+    """
+    game = (
+        event(22, pack("u64", 1000000) + pack("u8", 0), serial=1)
+        + parallel_records([
+            (1002000, 8, True),       # FrameTime begins
+            (1010000, 9, True),       # WaitForTasks begins, inside it
+            (1014000, None, False),   # and ends
+            (1014000, 11, True),      # FScopeLock begins, inside FrameTime too
+            (1016000, None, False),   # and ends
+            (1018000, None, False),   # FrameTime ends
+        ])
+        + event(23, pack("u64", 1020000) + pack("u8", 0), serial=2)
+        + event(22, pack("u64", 1020000) + pack("u8", 0), serial=3)
+        + parallel_records([
+            (1022000, 8, True),       # FrameTime begins, 8 ms, alone
+            (1030000, None, False),
+        ])
+        + event(23, pack("u64", 1060000) + pack("u8", 0), serial=4)
+    )
+    worker = parallel_records([
+        (1005000, 10, True),          # WorkerTask: 1,005,000 -> 1,012,000, beside the game thread
+        (1012000, None, False),
+        (1015000, 11, True),          # FScopeLock: 1,015,000 -> 1,017,000, while the game thread
+        (1017000, None, False),       # is inside its own lock-named scope
+    ])
+    return {2: game, 4: worker}
+
+
+def parallel_trace() -> bytes:
+    """A capture two threads worked in at once: the fixture `test_parallel` is pinned against."""
+    return build_trace(
+        events_stream=parallel_schema(), importants_stream=parallel_importants(),
+        threads=parallel_streams(),
+    )
+
+
 def work_trace() -> bytes:
     """A capture whose frames have timer work in them: four frames, one of them a hitch.
 
