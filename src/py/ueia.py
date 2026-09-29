@@ -16,6 +16,10 @@ Commands:
   timers <capture>            the CPU profiler's timer specs, with file:line
                               (--filter TEXT, --limit N)
   frames <capture>            BeginFrame/EndFrame pairs, in cycles (--limit N)
+  tasks <capture>             the task graph and the longest dependency chain through it
+                              (--limit N caps the steps listed, --graph dot|mermaid|json
+                              writes the graph itself; exit 2 when the capture carries no
+                              TaskTrace events -- re-record with `...,task`)
   bottleneck <capture>        what bounds a frame: the game thread, the render thread,
                               the GPU, or none of them -- every verdict measured against
                               the budget, with the evidence and the reasons it cannot
@@ -104,6 +108,7 @@ from commands import (
     cmd_schema,
     cmd_selftest,
     cmd_summary,
+    cmd_tasks,
     cmd_threads,
     cmd_timers,
     cmd_verify,
@@ -121,6 +126,7 @@ _CAPTURE_COMMANDS = {
     "frames": cmd_frames,
     "bottleneck": cmd_bottleneck,
     "summary": cmd_summary,
+    "tasks": cmd_tasks,
     "verify": cmd_verify,
     "parse": cmd_parse,
     "cache": cmd_cache,

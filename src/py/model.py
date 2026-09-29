@@ -17,11 +17,12 @@ whatever could not be decoded is counted rather than guessed at.
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict
 
 import decode
 import events
 import gpu
+import tasks
 from concurrent.futures import ProcessPoolExecutor, wait
 
 import schema
@@ -40,6 +41,10 @@ from shapes import (
     TID_EVENTS,
     TID_IMPORTANTS,
     TOOL_VERSION,
+    TaskEventRow,
+    TaskRow,
+    TaskStepRow,
+    TaskWaitRow,
     ThreadRow,
     TimerRow,
     UeiaError,
@@ -101,6 +106,8 @@ _COUNTS_KEYS = (
     "gpu_events",
     "gpu_unreadable",
     "gpu_specs",
+    # the task channel: the events themselves (the graph is built once, after the merge)
+    "task_events",
 )
 
 
@@ -153,6 +160,11 @@ class SessionModel(TypedDict):
     frame_work: List[FrameWorkRow]
     gpu_specs: List[GpuSpecRow]
     gpu_frames: List[GpuFrameRow]
+    tasks: List[TaskRow]
+    task_edges: List[Tuple[int, int]]
+    task_path: List[TaskStepRow]
+    task_waits: List[TaskWaitRow]
+    task_counts: Dict[str, int]
     bookmarks: List[BookmarkRow]
     counters: List[CounterSpecRow]
     counter_values: Dict[str, int]
@@ -246,6 +258,7 @@ class ThreadShare(TypedDict):
     frames: List[FrameRow]
     frame_work: List[FrameWorkRow]
     gpu_frames: List[GpuFrameRow]
+    task_events: List[TaskEventRow]
     bookmarks: List[BookmarkRow]
 
 
@@ -261,6 +274,7 @@ class ModelAcc(TypedDict):
     frames: List[FrameRow]
     frame_work: List[FrameWorkRow]
     gpu_frames: List[GpuFrameRow]
+    task_events: List[TaskEventRow]
     bookmarks: List[BookmarkRow]
 
 
@@ -324,6 +338,34 @@ def _flush_window(window: _Window, occupancy: List[int], pairs: int) -> None:
     window.covered = occupancy[0]
     window.waiting = occupancy[1]
     window.pairs = pairs
+
+
+def _place_chain(steps: List[TaskStepRow], frames: Sequence[FrameRow]) -> None:
+    """Tag every step of a chain with the frame its thread was in when the task began.
+
+    The chain belongs to the capture, not to one frame -- it can cross frames -- and this is what
+    lets a report say which frames it touched. A task that ran on a thread with no frames, or began
+    in a gap between two of them, gets None: the honest answer, not the nearest frame.
+    """
+    by_thread: Dict[int, List[FrameRow]] = {}
+    for row in frames:
+        by_thread.setdefault(int(row["tid"]), []).append(row)
+    for rows in by_thread.values():
+        rows.sort(key=lambda row: int(row["begin_cycle"]))
+    for step in steps:
+        rows = by_thread.get(int(step["started_tid"]))
+        if not rows:
+            continue
+        cycle = int(step["begin_cycle"])
+        low, high = 0, len(rows)
+        while low < high:                     # the first frame that ends at or after the task began
+            middle = (low + high) // 2
+            if int(rows[middle]["end_cycle"]) < cycle:
+                low = middle + 1
+            else:
+                high = middle
+        if low < len(rows) and int(rows[low]["begin_cycle"]) <= cycle:
+            step["frame_index"] = int(rows[low]["index"])
 
 
 def _pair_windows(stream: bytes, tid: int, registry: schema.SchemaRegistry,
@@ -413,6 +455,7 @@ def _walk_tid(
     anomalies: List[Anomaly] = []
     bookmarks: List[BookmarkRow] = []
     gpu_frames: List[GpuFrameRow] = []
+    task_events: List[TaskEventRow] = []
     windows = _pair_windows(stream, tid, registry, counts)
     occupancy_on = specs is not None
     spec_count = len(specs) if specs is not None else 0
@@ -600,6 +643,45 @@ def _walk_tid(
             if counter_id is not None:
                 key = str(counter_id)
                 counter_values[key] = counter_values.get(key, 0) + 1
+        elif full_name.startswith(tasks.PREFIX):
+            values = decode.event_values(row, stream, event)
+            kind = full_name[len(tasks.PREFIX):]
+            if kind == "Init":
+                continue
+            stamp = decode.value_int(values, "Timestamp")
+            if stamp is None:
+                continue
+            counts["task_events"] += 1
+            if kind in ("WaitingStarted", "WaitingFinished"):
+                # the wait events carry no task id: the *recording* thread is what is waiting, and
+                # `Tasks` (an aux array) names what it waits for -- the count is what the report uses
+                waited = values.get("Tasks")
+                other = (len(waited) // 8) if isinstance(waited, (bytes, bytearray)) else 0
+                task_events.append(TaskEventRow(
+                    kind=kind, task=0, stamp=stamp, other=other, size=0, flags=0, text="", tid=tid,
+                ))
+                continue
+            task_id = decode.value_int(values, "TaskId")
+            if task_id is None:
+                continue
+            other = 0
+            size = 0
+            flags = 0
+            text = ""
+            if kind == "Created":
+                size = decode.value_int(values, "TaskSize") or 0
+            elif kind == "Launched":
+                size = decode.value_int(values, "TaskSize") or 0
+                to_execute = decode.value_int(values, "ThreadToExecuteOn") or 0
+                tracked = 1 if values.get("Tracked") else 0
+                flags = (to_execute << 1) | tracked
+                text = decode.value_str(values, "DebugName")
+            elif kind == "SubsequentAdded":
+                other = decode.value_int(values, "SubsequentId") or 0
+            task_events.append(TaskEventRow(
+                kind=kind, task=task_id, stamp=stamp, other=other, size=size, flags=flags,
+                text=text, tid=tid,
+            ))
         elif full_name == gpu.FRAME_EVENT:
             values = decode.event_values(row, stream, event)
             gpu_row = gpu.frame_row(values, tid, values.get("Data"))
@@ -634,7 +716,7 @@ def _walk_tid(
     return ThreadShare(
         tid=tid, row=trow, counts=counts, uid_counts=uid_counts, counter_values=counter_values,
         region_counts=region_counts, anomalies=anomalies, frames=frame_rows, frame_work=frame_work,
-        gpu_frames=gpu_frames, bookmarks=bookmarks,
+        gpu_frames=gpu_frames, task_events=task_events, bookmarks=bookmarks,
     )
 
 
@@ -673,6 +755,7 @@ def _merge_share(acc: "ModelAcc", share: ThreadShare) -> None:
     acc["frames"].extend(share["frames"])
     acc["frame_work"].extend(share["frame_work"])
     acc["gpu_frames"].extend(share["gpu_frames"])
+    acc["task_events"].extend(share["task_events"])
     acc["bookmarks"].extend(share["bookmarks"])
 
 
@@ -946,6 +1029,7 @@ def build_model(
     frame_rows: List[FrameRow] = []
     frame_work: List[FrameWorkRow] = []
     gpu_frames: List[GpuFrameRow] = []
+    task_events: List[TaskEventRow] = []
     bookmarks: List[BookmarkRow] = []
     units = [
         (tid, stream_set.streams[tid])
@@ -974,6 +1058,7 @@ def build_model(
         frames=frame_rows,
         frame_work=frame_work,
         gpu_frames=gpu_frames,
+        task_events=task_events,
         bookmarks=bookmarks,
     )
     for share in shares:
@@ -1013,6 +1098,18 @@ def build_model(
                 "%s at offset %d (value %d): %s" % (kind, offset, value, message)
             )
 
+    # -- the task graph: built once, here, because a task's events can come from any thread
+    frequency = int(session.get("cycle_frequency", 0) or 0)
+    tasks_table, task_edges, chain, task_waits, task_counts = tasks.build_graph(
+        task_events, frequency,
+    )
+    kept_tasks = tasks.top_tasks(tasks_table, tasks.TASK_KEEP)
+    _place_chain(chain.steps, frame_rows)
+    task_counts["dropped"] = max(0, len(tasks_table) - len(kept_tasks))
+    task_counts["path_steps"] = len(chain.steps)
+    task_counts["path_cycles"] = chain.total_cycles
+    task_counts["path_ms"] = int(chain.total_cycles * 1000.0 / frequency) if frequency else 0
+
     model = SessionModel(
         tool_version=TOOL_VERSION,
         session=session,
@@ -1027,6 +1124,12 @@ def build_model(
         gpu_frames=sorted(gpu_frames, key=lambda row: (
             int(row["base_us"]), int(row["number"]), int(row["tid"]),
         )),
+        tasks=kept_tasks,
+        task_edges=tasks.edges_between(task_edges, [task["id"] for task in kept_tasks],
+                                       tasks.EDGE_KEEP),
+        task_path=chain.steps,
+        task_waits=sorted(task_waits, key=lambda row: (int(row["tid"]), int(row["begin_cycle"]))),
+        task_counts=task_counts,
         bookmarks=bookmarks,
         counters=[counters[spec_id] for spec_id in sorted(counters)],
         counter_values=counter_values,

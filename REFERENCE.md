@@ -448,3 +448,55 @@ What the corpus says, with those rules (pinned as transcripts):
 | `editor-pie-1` | 61 of 1413 frames game-thread bound; 1320 unexplained, **1094 of them pinned to a display period** (an editor throttled to ~3 FPS: p50 frame 33.4 ms, GPU p50 0.25 ms); the 121.5 s PIE frame is game-bound (118,999.8 ms of `UEditorEngine::StartPlayInEditorSession` inclusive inside it) |
 | `game-pc-2` | 9 of 771 frames bound (1 game, 8 render); 761 unexplained with **no GPU channel to check against** — its game thread is inside wait-shaped scopes (`FlushRenderingCommands`, `GameThreadWaitForTask`) for its whole 905 ms frames, so "waiting on something this capture cannot show" is the honest answer |
 | `viewer-pc-3` | no `Misc.BeginFrame` pairs at all: exit 2, never zero |
+
+## 12. The task graph, and the longest chain through it
+
+`ueia tasks` answers what a timeline cannot: *which* work a slow frame was waiting on. The channel is
+`TaskTrace` (the command line token is `task`; the engine ships a `TaskGraph` preset for
+`-trace=cpu,gpu,frame,log,bookmark,screenshot,region,task`), and it is **task-centric** rather than
+per-thread: `FTaskBase` writes its events from whichever thread it is on, so the model collects the
+events per thread and builds the graph once, after the merge (`tasks.build_graph`).
+
+Every event is flag-less and carries `uint64 Timestamp` = `FPlatformTime::Cycles64()` -- a *global*
+counter, which is why timestamps from different threads are comparable here when the trace's own
+event times are not (`TaskTrace.cpp:14-73`):
+
+| event | fields | meaning |
+|---|---|---|
+| `Created` | `Timestamp, TaskId, TaskSize` | the task object exists |
+| `Launched` | `..., DebugName, Tracked, ThreadToExecuteOn, TaskSize` | its name, and where it may run |
+| `Scheduled` | `Timestamp, TaskId` | prerequisites met, it is queued |
+| `SubsequentAdded` | `Timestamp, TaskId, SubsequentId` | completing the first unlocks the second -- the **only** dependency record |
+| `Started`/`Finished` | `Timestamp, TaskId` | the body runs: this pair is a task's **duration** |
+| `Completed`/`Destroyed` | `Timestamp, TaskId` | nested tasks done; the object freed |
+| `WaitingStarted`/`WaitingFinished` | `Timestamp[, uint64[] Tasks]` | the *recording* thread blocks, waiting for those tasks |
+
+A task's life is four intervals and only one of them is work (`TasksProfiler.cpp:601-676`):
+`Launched→Scheduled` is waiting for prerequisites, `Scheduled→Started` is queued, **`Started→Finished`
+is executing** (the duration everything ranks by), and `Finished→Completed` is waiting for nested
+tasks. `ThreadToExecuteOn` is the engine's own `ENamedThreads` packing
+(`TaskGraphInterfaces.h:56-108`): the low byte names the thread, the high bits its queue and
+priorities.
+
+**The critical path is the engine's arithmetic**, from the Insights task-graph profiler
+(`TaskGraphProfilerManager.cpp:759-760, 807-808`): walk the prerequisite edges and take, at every
+branch, the chain whose **sum of executing durations** is longest -- `MaxChainDuration +
+(Finished - Started)`, recursively. It adds no waiting and no gaps: what it answers is "if this chain
+could not be shorter, the frame could not be faster", and a gap between two tasks of the chain is a
+scheduling artefact, drawn as an edge rather than summed. Our implementation walks it with an
+explicit stack (a deep graph cannot exhaust the interpreter's) and a three-colour mark, and a cycle
+in those edges -- which the writer could not have meant -- is **counted and its edge ignored**
+(`task_counts["ignored_edges"]`), never followed.
+
+What the model keeps is bounded and says so: the chain is always complete (it is a chain, not a
+graph), while the task table keeps the `TASK_KEEP` longest and the graph the `EDGE_KEEP` edges among
+them, with `task_counts["dropped"]` counting what did not fit -- a capture that ran a million tasks
+must not put a million rows in the cache.
+
+Two things a real `task` capture will confirm and this machine cannot, because **none of the three
+registered captures carries the channel** (`tasks` exits 2 with the re-record line on all three):
+whether `TaskTrace.Launched` arrives with `MaybeHasAux` in its schema record (the engine's macro
+declares no flags, while every corpus event with a string field carries the flag -- if it is not
+written, the task *names* would need the aux read by another rule), and whether an editor or game
+capture's task count fits the table. The protocol above is pinned to the engine source; the
+fields, events and arithmetic are not guesses.

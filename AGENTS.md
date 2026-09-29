@@ -46,7 +46,8 @@ per-frame batches) → `container` (header + packet walk) → `streams` (per-thr
 → `events` (framing: records, events, aux, scopes) → `schema` (the vocabulary) → `decode`
 (values + the batch format) → `model` (the session model, incl. the per-frame work attribution
 and occupancy) → `summary` (the budget, percentiles and histograms a frame-time report is
-defined by) → `bottleneck` (the classification on top of them: what bounds a frame) → `cache`
+defined by) → `bottleneck` (the classification on top of them: what bounds a frame) → `tasks`
+(the task channel's graph, its critical path, and the DOT/Mermaid exports) → `cache`
 (the parse cache) → `goldens` (the corpus harness) → `commands` (the commands and their
 rendering) → `ueia.py` (the CLI, which re-exports them all for scripts and tests).
 

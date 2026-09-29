@@ -15,6 +15,7 @@ command was warm).
 from __future__ import annotations
 
 import csv as csv_module
+import json
 import os
 import sys
 import tempfile
@@ -30,6 +31,7 @@ import engine
 import lz4
 import schema
 import summary
+import tasks
 import timing
 import toolrun
 import streams
@@ -51,6 +53,8 @@ _VALUE_OPTIONS = frozenset((
     "format", "limit", "tid", "filter", "jobs", "engine-dir",
     # the summary layer: a budget in either of the two spellings the practice uses
     "budget", "budget-ms",
+    # the task graph's export form
+    "graph",
     # the csv family: ours on the left, the exe's own flag in `_csv_*` below
     "out", "json", "stat", "stats", "csvs", "dir", "pattern", "outlier-stat", "outlier-threshold",
     "metadata-filter", "start-event", "in", "out-format", "compress", "set-metadata", "batch",
@@ -736,6 +740,154 @@ def cmd_bottleneck(capture: str, args: List[str]) -> int:
         ("frame", "at s", "ms", "verdict", "work ms", "gpu ms", "why / what ran in it"),
         rows,
         (True, True, True, False, True, True, False),
+        options.fmt(),
+        lines,
+    )
+    return 0
+
+
+def cmd_tasks(capture: str, args: List[str]) -> int:
+    """`tasks <capture> [--limit N] [--graph dot|mermaid|json]`: the task graph and its longest chain.
+
+    The task channel's own answer to "what was this capture waiting on": every `TaskTrace` event the
+    walk collected becomes a task, `SubsequentAdded` becomes the dependency edges, and the chain the
+    engine's own task-graph profiler computes -- the max sum of executing durations along those edges
+    (`TaskGraphProfilerManager.cpp:759-760`) -- is reported step by step, oldest first, with the
+    frame each step ran in.
+
+    `--graph` writes the dependency graph (between the tasks the model kept, and the chain) as
+    Graphviz DOT, Mermaid, or the model's own JSON, on stdout with the prose on stderr -- the shape
+    of every row command's machine form.
+
+    Exit codes: 0 reported, 2 the capture carries no `TaskTrace` events (the re-record line, never an
+    empty path), 1 a failure.
+    """
+    options = parse_options(args)
+    if options.values.keys() - {"limit", "graph", "format", "jobs"} or options.flags:
+        raise UsageError("tasks takes --limit, --graph, --format and --jobs")
+    limit = options.number("limit", _DEFAULT_BREAKER_LIMIT * 4)
+    graph = options.values.get("graph", "")
+    if graph and graph not in ("dot", "mermaid", "json"):
+        raise UsageError("--graph takes dot, mermaid or json, not %r" % (graph,))
+    view, model, _cached = load_model(capture, _jobs(options))
+    session = model.get("session", {})
+    task_counts = model.get("task_counts", {})
+    lines: List[str] = []
+    if not task_counts.get("events"):
+        lines.append("capture   : %s" % (view.path.name,))
+        lines.append("tasks     : none -- this capture carries no TaskTrace events")
+        lines.append("hint      : re-record with `-trace=cpu,frame,log,bookmark,counters,task` "
+                     "(or the engine's `TaskGraph` preset) to get a task graph")
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        return 2
+    frequency = int(session.get("cycle_frequency", 0) or 0)
+    path = [row for row in model.get("task_path", []) if isinstance(row, dict)]
+    steps = path if limit == 0 else path[:limit]
+    duration = seconds_for_cycle(model, int(session.get("last_cycle", 0)))
+    lines.append("capture   : %s%s" % (
+        view.path.name, ", %.3f s" % (duration,) if duration is not None else "",
+    ))
+    lines.append(
+        "tasks     : %d task(s) from %d TaskTrace event(s), %d dependency edge(s)" % (
+            task_counts.get("tasks", 0), task_counts.get("events", 0), task_counts.get("edges", 0),
+        )
+    )
+    lines.append(
+        "states    : %d ran, %d never finished, %d event(s) unreadable, %d edge(s) in a cycle "
+        "(ignored)" % (
+            task_counts.get("tasks", 0) - task_counts.get("unfinished", 0),
+            task_counts.get("unfinished", 0), task_counts.get("unreadable", 0),
+            task_counts.get("ignored_edges", 0),
+        )
+    )
+    frames = sorted(set(
+        int(step["frame_index"]) for step in path
+        if step["frame_index"] is not None
+    ))
+    lines.append(
+        "critical  : %.3f ms over %d step(s), %d frame(s) touched (%s)" % (
+            task_counts.get("path_ms", 0), task_counts.get("path_steps", 0), len(frames),
+            ", ".join("frame %d" % (index,) for index in frames[:6]) or "no frame on this thread",
+        )
+    )
+    waits = [row for row in model.get("task_waits", []) if isinstance(row, dict)]
+    if waits:
+        lines.append("waiting   : %d span(s) on %d thread(s), %.3f ms total" % (
+            len(waits), len(set(int(row["tid"]) for row in waits)),
+            sum(float(row["duration_ms"]) for row in waits),
+        ))
+    else:
+        lines.append("waiting   : no WaitingStarted/Finished span in this capture")
+    if task_counts.get("dropped"):
+        lines.append("note      : %d task(s) beyond the %d the model keeps are not listed "
+                     "(the chain is always complete)" % (
+                         task_counts["dropped"], len(model.get("tasks", [])),
+                     ))
+    if graph:
+        edges = [(int(edge[0]), int(edge[1])) for edge in model.get("task_edges", [])]
+        labels = tasks.labels_for(
+            [row for row in model.get("tasks", []) if isinstance(row, dict)], frequency,
+        )
+        if graph == "dot":
+            text = tasks.dot(edges, labels)
+        elif graph == "mermaid":
+            text = tasks.mermaid(edges, labels)
+        else:
+            text = json.dumps({
+                "schemaVersion": 1,
+                "capture": view.path.name,
+                "tasks": [
+                    {
+                        "id": int(row["id"]), "name": row["name"], "size": int(row["size"]),
+                        "tracked": bool(row["tracked"]),
+                        "threadToExecuteOn": tasks.describe_execution(
+                            int(row["thread_to_execute_on"])
+                        ),
+                        "started": row["started"], "finished": row["finished"],
+                        "durationMs": round(tasks.duration_cycles(row) * 1000.0 / frequency, 3)
+                        if frequency else 0.0,
+                        "prerequisites": list(row["prerequisites"]),
+                    }
+                    for row in model.get("tasks", []) if isinstance(row, dict)
+                ],
+                "edges": [[int(first), int(second)] for first, second in edges],
+                "criticalPath": [
+                    {"id": int(step["id"]), "name": step["name"],
+                     "durationMs": round(float(step["duration_ms"]), 3),
+                     "frame": step.get("frame_index")}
+                    for step in path
+                ],
+                "counts": dict(task_counts),
+            }, indent=2, sort_keys=True) + "\n"
+        if graph != "json":
+            for line in lines:
+                sys.stderr.write(line + "\n")
+        sys.stdout.write(text)
+        if graph == "json" and options.fmt() != "json":
+            for line in lines:
+                sys.stderr.write(line + "\n")
+        return 0
+    rows: List[Tuple[str, ...]] = []
+    for step in steps:
+        tid = int(step["started_tid"])
+        frame = step.get("frame_index")
+        rows.append((
+            str(step["id"]),
+            "%.3f" % (float(step["duration_ms"]),),
+            tasks.thread_name(int(step["thread_to_execute_on"]))
+            or ("tid %d" % (tid,) if tid else "unknown thread"),
+            "-" if frame is None else str(frame),
+            step["name"],
+        ))
+    if len(path) > len(steps):
+        lines.append("note      : %d more step(s) on the chain; --limit 0 lists them all" % (
+            len(path) - len(steps),
+        ))
+    render_rows(
+        ("task", "ms", "thread", "frame", "name"),
+        rows,
+        (True, True, False, True, False),
         options.fmt(),
         lines,
     )
@@ -1430,6 +1582,7 @@ __all__ = [
     "cmd_frames",
     "cmd_bottleneck",
     "cmd_summary",
+    "cmd_tasks",
     "cmd_verify",
     "cmd_parse",
     "cmd_cache",

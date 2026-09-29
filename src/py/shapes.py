@@ -256,6 +256,71 @@ class FrameRow(TypedDict):
     wait_cycles: Optional[int]
 
 
+class TaskEventRow(TypedDict):
+    """One `TaskTrace` event as the walk saw it: raw, per thread, merged by `build_model`.
+
+    The channel is task-centric and its events for one task can be recorded by different threads,
+    so the walk cannot build the graph on its own: it collects these rows and `tasks.build_graph`
+    (called once, after the merge) turns them into tasks, dependencies and a critical path.
+    `kind` is the event's own name suffix, `other` whatever that event carries besides the id
+    (a size, a subsequent id, a thread-to-execute-on, or the count of tasks being waited on).
+    """
+
+    kind: str
+    task: int
+    stamp: int
+    other: int
+    size: int
+    flags: int
+    text: str
+    tid: int
+
+
+class TaskRow(TypedDict):
+    """One task of the capture, merged across the threads that recorded its events."""
+
+    id: int
+    name: str
+    size: int
+    tracked: bool
+    thread_to_execute_on: int
+    created: Optional[int]
+    launched: Optional[int]
+    scheduled: Optional[int]
+    started: Optional[int]
+    finished: Optional[int]
+    completed: Optional[int]
+    destroyed: Optional[int]
+    started_tid: int
+    finished_tid: int
+    prerequisites: List[int]
+    subsequents: List[int]
+
+
+class TaskStepRow(TypedDict):
+    """One task of a critical-path chain, with the numbers the report ranks by."""
+
+    id: int
+    name: str
+    duration_cycles: int
+    duration_ms: float
+    started_tid: int
+    thread_to_execute_on: int
+    begin_cycle: int
+    end_cycle: int
+    frame_index: Optional[int]
+
+
+class TaskWaitRow(TypedDict):
+    """One `WaitingStarted`/`WaitingFinished` span: a thread blocked inside a task's body."""
+
+    tid: int
+    begin_cycle: int
+    end_cycle: int
+    tasks: int
+    duration_ms: float
+
+
 class FrameWorkRow(TypedDict):
     """What one frame was spent on: the scope pairs attributed to it, biggest first.
 
