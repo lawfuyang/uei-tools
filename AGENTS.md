@@ -117,17 +117,29 @@ fixture traces are built in memory in `tests/`. Wrapped exes are stubbed with a 
 for the same reason. Checks that *do* need this machine's captures or a real engine directory
 are the goldens half, reported separately, where "not compared" is never "pass".
 
-## Engine tooling: one way in, and it is a flag
+## Engine tooling: the flag, the variable, then a search that says what it picked
 
-`--engine-dir <dir>` (or `$UEI_ENGINE_DIR`) is the *only* way any command finds engine-provided
-tooling — the CsvTools executables, later the engine's trace programs, and `Build.version` for a
-report's meta (the contract is `engine.py`). A **flag** naming something that is not an engine tree
-is a usage error: naming the wrong directory is a mistake, not an absence. A **variable** naming one
-is reported and ignored, because an ambient setting must never change behaviour quietly. Nothing
-named at all is legal, and then the commands that need tooling report **skipped** (exit 2) with the
-hint — the same "nothing to compare" rule as the corpus half. Every wrapped call records the exe's
-SHA-256 and exact argv (`toolrun.py`), because the unwrapped tool is the authority and our output
-has to say which build answered.
+`--engine-dir <dir>` (or `$UEI_ENGINE_DIR`, and `engine.py` holds the contract) names the tree whose
+tooling this repo uses — the CsvTools executables, the source tree for file:line mapping, and
+`Build.version` for a report's meta. An **explicit flag that names a tree wins outright and nothing is
+searched**: an instruction is never second-guessed. A **flag naming something which is not one** is
+printed and then searched past (2026-09-29 — it used to end the command), and if the search finds
+nothing it is still a usage error. A **variable** naming a non-tree is reported and ignored, because
+an ambient setting must never change behaviour quietly.
+
+Nothing named at all **searches this machine** (REFERENCE §18): the launcher's install manifests, the
+source builds the engine registers under `HKCU\...\Unreal Engine\Builds`, and the usual install
+directories on `C:`–`H:`, one or two levels deep and never a network drive — four trees in 0.05 s on
+the machine this was written on. Two rules the code keeps, because a search can lie by omission:
+**the winner is named with its version and its gaps** (`rank` prefers a complete tree over a newer
+partial one, then the newest version compared as *numbers*, then the most tools, then the path), and
+**`UEIA_NO_ENGINE_SCAN=1` switches it off** for callers whose output must not depend on what is
+installed — the hermetic suite, and the corpus harness for every pinned command (auto-discovery
+changed six transcripts the moment it landed: `sources` and `advice` map through whatever tree the
+machine has). Commands that need tooling and find none report **skipped** (exit 2) with the hint —
+the same "nothing to compare" rule as the corpus half. Every wrapped call records the exe's SHA-256 and
+exact argv (`toolrun.py`), because the unwrapped tool is the authority and our output has to say which
+build answered.
 
 ## Channels: absent is not zero
 

@@ -826,3 +826,66 @@ one real-capture invariant check.
 no pair inside it (the tree is empty and the `pairing` line says the counts). Exit 0 a tree was built
 / 2 the capture cannot answer — no `CpuProfiler` timer specs, no `Misc.BeginFrame` pair for the
 thread, or a `--frame` that thread does not have.
+
+## 18. Finding an engine tree (`--engine-dir`, `$UEI_ENGINE_DIR`, and the search)
+
+Three consumers need an engine tree (§2's CSV toolbox, §14's source mapping, every report's version
+stamp) and one module owns the question (`engine.py`). What a tree has to hold — the **inventory** —
+is the list of things this repo can actually use:
+
+| Part | Where | Needed for |
+|---|---|---|
+| the CsvTools executables | `Engine\Binaries\DotNET\CsvTools` | the CSV toolbox (`csv`, README §2) — all eight this repo wraps (`csvinfo`, `CSVSplit`, `CsvConvert`, `CSVFilter`, `CSVCollate`, `CSVToSVG`, `PerfreportTool`, `RegressionsReport`) |
+| `Build.version` | `Engine\Build\Build.version` | every report's `meta` block, and the version the search ranks by |
+| the source tree | `Engine\Source` | module/source mapping (§14) — optional, and its absence is reported as "module unknown", never as zero |
+
+**Resolution order: the flag, the environment, then a search.** An explicit `--engine-dir` that names
+a tree is used as given and *nothing is searched* — an instruction is never second-guessed. A flag
+that names something which is **not** one is said out loud and then searched past (2026-09-29: it used
+to end the command; a typo is a mistake worth reporting, not a reason to refuse work that a tree on
+this machine can do) — and if the search finds nothing, the flag's mistake is still a usage error
+(exit 2). `$UEI_ENGINE_DIR` is reported and *ignored* when it names a non-tree, because an ambient
+setting must not change what a command does quietly. Nothing anywhere is legal: the commands that need
+engine tooling report **skipped** with the hint.
+
+**What the search is.** Three sources, no directory walk:
+
+* **the launcher's own install list** — `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\*.item`,
+  one JSON per install, read for its `InstallLocation`. A file that cannot be read is skipped: a
+  search may find nothing, never fail;
+* **the source builds the engine registers** — `HKCU\Software\Epic Games\Unreal Engine\Builds`, which
+  is where a source build lists itself so it can be run without a launcher entry;
+* **the usual install directories** on `C:`–`H:` — `<drive>\Epic Games\UE_*`,
+  `<drive>\Program Files\Epic Games\UE_*`, `<drive>\UE_*`, `<drive>\UnrealEngine*`,
+  `<drive>\Unreal Engine\UE_*` and friends (`INSTALL_SUBDIRS`), one or two levels deep. Network drives
+  are never probed: a disconnected one can block for seconds, which is not a *quick* scan.
+
+Measured on the machine this was written on (2026-09-29): **four engine trees in 0.05 s** — two at
+5.8.3 (both complete), a project-local 5.7.0, and a 5.4.4 missing `RegressionsReport.exe` — of which
+the launcher list and the registry between them found all four and the directory globs found none,
+which is why the first two are in the search at all.
+
+**What is picked, and what is printed.** `rank` orders the candidates: a **complete** tree before a
+partial one (a 5.8 install with no CsvTools cannot run `csv` at all, while a complete 5.6 can run
+every part of this repo), then the **newest version** — compared as numbers, because `UE_5.10` is
+newer than `UE_5.9` and a string comparison says the opposite — then how many tools are there, then
+the path, so the answer is stable run to run. The version comes from `Build.version`, falling back to
+the directory name (`UE_5.8` is exactly how a launcher install is named). Whatever wins, the report
+says so:
+
+```
+scanned  : C:\Workspace\UnrealEngine_Code_Inner (5.8.3, 8 of 8 CsvTools, source tree present)
+           -- 4 engine tree(s) on this machine
+```
+
+and a winner with gaps names them (`scanned  : it lacks 1 CsvTools executable(s) (RegressionsReport.exe)`),
+because a partial tree chosen silently would be a lie of omission. There is no per-consumer choice: the
+tree that gives the most is used for everything, and what it lacks is printed.
+
+**The search is switched off with `UEIA_NO_ENGINE_SCAN=1`** (`shapes.ENV_NO_ENGINE_SCAN`). Two callers
+use it, for the same reason — output must not depend on what is installed on the machine running it:
+the hermetic suite sets it, and the corpus harness passes it to every pinned command, because `sources`
+and `advice` map file:line through whatever tree the machine has. With auto-discovery landed but that
+switch absent, six transcripts (sources and advice, all three captures) differed immediately: the pins
+record the *no engine tree* behaviour, which is the deterministic half, and discovery is covered by its
+own tests (`test_engine.TestTheSearch`).

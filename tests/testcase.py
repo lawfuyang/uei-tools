@@ -46,11 +46,12 @@ class UeiaTestCase(unittest.TestCase):
         self._scratch = tempfile.TemporaryDirectory(prefix="ueia-test-")
         self.addCleanup(self._scratch.cleanup)
         self.dir = Path(self._scratch.name)
-        self._env_patch: Optional[_EnvPatch] = None
+        values = {shapes.ENV_NO_ENGINE_SCAN: "1"}
         if not self.use_cache:
-            self._env_patch = _EnvPatch({shapes.ENV_NO_CACHE: "1"})
-            self._env_patch.start()
-            self.addCleanup(self._env_patch.stop)
+            values[shapes.ENV_NO_CACHE] = "1"
+        self._env_patch = _EnvPatch(values)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
 
     def write_capture(self, data: bytes, name: str = "fixture.utrace") -> Path:
         """Write fixture bytes into the scratch directory."""

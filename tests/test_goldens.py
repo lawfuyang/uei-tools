@@ -6,13 +6,14 @@ import json
 import subprocess
 import unittest
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Dict, List
 from unittest import mock
 
 from testcase import UeiaTestCase
 
 import cache
 import goldens
+import shapes
 from fixtures import demo_trace
 
 KEY = "fixture-1"
@@ -33,9 +34,11 @@ class TestTheRunner(UeiaTestCase):
 
     def test_the_command_name_comes_first_and_the_capture_after_it(self) -> None:
         seen: List[List[str]] = []
+        passed: List[Dict[str, Any]] = []
 
         def fake_run(command: List[str], **kwargs: Any) -> Any:
             seen.append(list(command))
+            passed.append(kwargs)
             return subprocess.CompletedProcess(command, 0, "out", "")
 
         with mock.patch.object(goldens.subprocess, "run", side_effect=fake_run):
@@ -50,6 +53,12 @@ class TestTheRunner(UeiaTestCase):
             "--format",
             "csv",
         ])
+        environment = passed[0]["env"]
+        self.assertEqual(environment[shapes.ENV_NO_ENGINE_SCAN], "1",
+                         "a transcript must not depend on the engine tree this machine happens to "
+                         "have: auto-discovery would embed its paths and only compare on machines "
+                         "with the same install")
+        self.assertIn("PATH", environment, "the rest of the environment is inherited, not replaced")
 
     def test_no_pinned_command_is_missing_its_command_name(self) -> None:
         """A pinned entry whose argv *is* the command would run the help text again."""

@@ -16,6 +16,7 @@ or a bad corpus file, **2** nothing to compare on this machine -- which means
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import container
 import schema
 import streams
-from shapes import UeiaError
+from shapes import ENV_NO_ENGINE_SCAN, UeiaError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLDENS_DIR = REPO_ROOT / "goldens"
@@ -140,12 +141,21 @@ def _run_command(name: str, argv: Tuple[str, ...], capture: Path) -> Tuple[int, 
         name,
         str(capture),
     ] + list(argv)
+    # The engine search is switched off for the pinned commands, and that is not incidental: with it
+    # on, `sources` and `advice` map file:line through whatever engine tree the *machine* happens to
+    # have (found 2026-09-29, 6 transcripts differing the moment auto-discovery landed), which is
+    # precisely what a transcript must not depend on -- it would embed a machine's paths and only
+    # compare on machines with the same install. The transcripts therefore pin the no-engine-tree
+    # behaviour, which is the deterministic half, and discovery is covered by its own tests.
+    environment = dict(os.environ)
+    environment[ENV_NO_ENGINE_SCAN] = "1"
     completed = subprocess.run(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         universal_newlines=True,
         cwd=str(REPO_ROOT),
+        env=environment,
     )
     return completed.returncode, completed.stdout
 

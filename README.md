@@ -31,7 +31,7 @@ bridge (§2), the summary layer and the analyses on top of it — is in `ROADMAP
 | Python 3.8+ | 3.11.3 tested; standard library only |
 | CMake + a C compiler | once per checkout: `python src\py\ueia.py lz4 --build` compiles `bin/ueia_lz4.dll` — the LZ4 decoder for the encoded packets (24,767 of them in the corpus) — from the source vendored under `src/cpp/third_party/lz4`, and does nothing when it is already current. Underneath it is `cmake -S . -B build` then `cmake --build build --config Release` |
 | A `.utrace` capture | the corpus, §1.1 — analysis is offline; nothing connects anywhere |
-| **Unreal Engine directory** | passed as `--engine-dir <dir>` (or `UEI_ENGINE_DIR`). It is used for three things: the **CsvTools executables** under `<engine-dir>\Engine\Binaries\DotNET\CsvTools` (§2), the engine **source tree** under `<engine-dir>\Engine\Source` (module/source mapping; optional), and the engine **version** from `<engine-dir>\Engine\Build\Build.version`, which stamps every report's `meta` block. Without it, the features that need it report **skipped** — never silently pass. |
+| **Unreal Engine directory** | passed as `--engine-dir <dir>` (or `UEI_ENGINE_DIR`). It is used for three things: the **CsvTools executables** under `<engine-dir>\Engine\Binaries\DotNET\CsvTools` (§2), the engine **source tree** under `<engine-dir>\Engine\Source` (module/source mapping; optional), and the engine **version** from `<engine-dir>\Engine\Build\Build.version`, which stamps every report's `meta` block. Name one and it is used as given; name nothing (or name something that is not an engine tree) and the machine is **searched** — the launcher's own install list, the source builds the engine registers, and the usual install directories — with the tree that gives the most picked and printed (REFERENCE §18). Without one anywhere, the features that need it report **skipped** — never silently pass. |
 | A CSV Profiler capture | optional: a `.csv` (or `.csv.bin`) written by the CSV Profiler, or a `.utrace` that carries the channel (see §2) — either can drive the CsvTools pipeline |
 | The LZ4 decoder | `bin/ueia_lz4.dll` (the build above), else whatever the system has (`$UEI_LZ4_DLL` names one explicitly: `lz4.dll`, `liblz4.so.1`, `liblz4.so`, `liblz4.dylib` in that order). There is **no decoder of our own** on purpose — one decoder means one answer — so a machine without one is a refusal that names the build command, never a silent fallback. `lz4` (below) reports which library answered, whether it matches the recipe that built it, and decodes a block whose answer is known |
 
@@ -137,7 +137,9 @@ session, no device and no human in front of a timeline.
 One entry point, rdc-tools style: `python src\py\ueia.py <command> <capture.utrace> [args]`.
 Plain text by default; the row commands take `--format table|csv|markdown` (in the non-table
 forms stdout is the table alone and the prose moves to stderr, and every cap applies in all
-three). Commands that need engine-provided tooling will take `--engine-dir` (or `UEI_ENGINE_DIR`).
+three). Commands that need engine-provided tooling take `--engine-dir` (or `UEI_ENGINE_DIR`) — and
+when neither names a usable tree, one is searched for on the machine and named in the output
+(REFERENCE §18); `UEI_NO_ENGINE_SCAN=1` switches that search off, which is what the test suite does.
 
 | Command | What it answers |
 |---|---|
