@@ -809,7 +809,7 @@ short one inside it.
 | capture | frame | inside scopes | **self** | the tree's shape |
 |---|---|---|---|---|
 | `game-pc-2` (tid 2) | #0 | 905.104 ms | **2.003 ms** | `FEngineLoop::Tick` → `FlushRenderingCommands` 670.799 → **`GameThreadWaitForTask` 670.761 self**: the frame is *waiting*, not computing — an answer `summary` cannot give |
-| `game-pc-2` worst three | #0, #77, #50 | | 2.003 / 0.913 / 0.394 ms | |
+| `game-pc-2` worst three | #0, #77, #888 | | 2.003 / 0.913 / 0.800 ms | |
 | `editor-pie-1` (tid 2) | #0 | 2,102.406 ms | **1,780.730 ms** | `FEngineLoop::Tick` holds the frame and almost all of it is self: an editor starting a PIE session is doing its own work |
 | `editor-pie-1` worst three | #0, #26, #50 | | 1,780.730 / 441.152 / 433.775 ms | |
 

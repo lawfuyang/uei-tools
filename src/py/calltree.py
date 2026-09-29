@@ -158,6 +158,7 @@ def stream_thread(stream: bytes, tid: int, registry: "schema.SchemaRegistry",
     """
     windows = [(int(row.get("index", 0)), int(row.get("begin_cycle", 0)),
                 int(row.get("end_cycle", 0))) for row in frames]
+    frame_ids = [row[0] for row in windows]
     frame_ends = [row[2] for row in windows]
     per_frame: Dict[int, int] = {}
     trees: Dict[int, List[Node]] = {}
@@ -231,20 +232,24 @@ def stream_thread(stream: bytes, tid: int, registry: "schema.SchemaRegistry",
                 else:
                     parent[3].setdefault(index, []).append(entry)
                     parent[4][index] = int(parent[4].get(index, 0)) + span
-                if index > pending:
+                if scan > pending:
                     # a newer frame is being filled: the older ones can no longer gain a pair,
-                    # because a pair's frames are contiguous and it is inside every open pair
-                    while 0 <= pending < index and pending < len(windows):
+                    # because a pair's frames are contiguous and it is inside every open pair.
+                    # `pending` and `scan` are **positions in this series**, not frame indices --
+                    # weighing indices invented a row for every index the series does not have and
+                    # skipped the rows it does (the corpus's `0, 2, 4` series; the game capture
+                    # reported 0.000 ms because of it, 2026-09-29)
+                    while 0 <= pending < scan:
                         if any(int(open_pair[1]) < windows[pending][2] for open_pair in stack):
                             break
-                        weigh(pending)
+                        weigh(frame_ids[pending])
                         pending += 1
-                    if pending < index:
-                        pending = index if index < len(windows) else -1
+                    if pending < scan:
+                        pending = scan
                 scan += 1
     counts["begins_unpaired"] = counts.get("begins_unpaired", 0) + len(stack)
-    for index in range(len(windows)):
-        weigh(index)
+    for position in range(len(frame_ids)):
+        weigh(frame_ids[position])
     return trees, per_frame, pairs
 
 

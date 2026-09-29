@@ -119,6 +119,34 @@ class TestTheFixtureTree(UeiaTestCase):
             _inclusive, own = calltree.totals(entry[0])
             self.assertEqual(own, entry[1], "frame %d: tree self != frame self" % (index,))
 
+    def test_a_series_with_gapped_indices_attributes_only_its_own_frames(self) -> None:
+        """The corpus's shape: a series filtered by thread *and* type has **gaps** in its indices.
+
+        The model's frame list holds every thread and every frame type, so `self`'s series (one
+        thread, one type) is `0, 2, 4, ...` on a capture that recorded two types -- the game capture
+        is exactly that. Anything that walks *consecutive* indices takes the indices in between for
+        frames of this series: it invents empty rows, which then enter the ranking alongside real
+        frames. The fixture's own contiguous `0, 1, 2` cannot catch that, which is why this test
+        passes the same capture's frames as a gapped subset (2026-09-29, found when the aligned rule
+        reported 0.000 ms on the game capture while every fixture test passed).
+        """
+        data = calltree_trace()
+        rows, _anomalies = container.walk_packets(data, container.parse_header(data))
+        stream_set = streams.assemble(data, rows)
+        built, _counts, _all = model.build_model(stream_set)
+        frames = list(built["frames"])
+        counts = model.zero_counts()
+        registry = schema.build_registry(stream_set.streams[0], [], counts)
+        names = {int(row["id"]): str(row["name"]) for row in built["timers"]}
+        subset = [frames[0], frames[2]]
+        _trees, per_frame, pairs = calltree.stream_thread(
+            stream_set.streams[2], 2, registry, counts, [], subset, names, keep=3)
+        self.assertEqual(pairs, 7)
+        self.assertEqual(sorted(per_frame), [0, 2],
+                         "a row per frame of *this* series, and none for the indices in between")
+        self.assertEqual(per_frame[0], 60000, "F0's self, and F2's below: the fixture's arithmetic")
+        self.assertEqual(per_frame[2], 80000)
+
     def test_the_cap_on_kept_frames_keeps_the_biggest_and_no_others(self) -> None:
         report, trees = self._pass(keep=1)
         self.assertEqual(int(report.frame["index"]), 2)
