@@ -706,3 +706,49 @@ a filter that quietly matched nothing.
 `advice` is the one report that **always exits 0**: it is the command that has something to say about
 every capture, including "this capture carries no frame pair" — which is its first finding, and the
 most severe one.
+
+## 16. The A/B gate (`compare`), and the baseline it ratchets
+
+The question a change asks is *did this make it better or worse?*, and `ueia compare` answers it by
+reducing two cached analyses to the same named metrics and differencing them **directionally**: every
+metric knows whether lower is better, so `frames.count` going up is not a regression and
+`occupancy.threads_working` going *down* is not an improvement. Nothing new is measured — both sides
+come from the same parser and the same definitions, and a comparison never mixes a fresh measurement
+with a cached one.
+
+The sections, in report order: **frames** (count, mean, p50, p95, p99, max, over-budget, hitches),
+**work** (attributed scope pairs, the share that could not be attributed, timelines the cap merged),
+**occupancy** (the frame thread's solo share, the others' work share, the threads working in the
+commonest frame, contended frames), **sources** (specs with a file:line, distinct files) and **tasks**
+(the graph's size and the critical path, when the channel is there). A metric present on one side
+only is reported and **not differenced**, and a metric whose baseline is zero has no ratio: the count
+is printed, and nothing is gated on it.
+
+**The gate is the practice's own list.** Only `frames.mean_ms`, `frames.p95_ms`, `frames.p99_ms` and
+`frames.hitches` can fail the run (`compare.GATED`), and only when the candidate is worse by more
+than `--threshold` — 10% by default, which is the practice's "p99 more than 10% worse".
+Improvements over the same threshold are **logged, never gated**: a gate that fails on improvement is
+a gate nobody keeps. The exit codes are the CI interface: **0** nothing worse than the threshold (or
+a baseline written), **1** the gate failed, **2** a usage error or nothing comparable.
+
+**A self-comparison is an empty diff** — the A/B honesty check rdc-tools carries: comparing a capture
+with itself (or with its own saved baseline) moves no metric, breaches nothing and improves nothing,
+and the report says so in words. It is asserted on the fixture, on two identical captures and on the
+corpus capture against itself.
+
+**The rolling baseline** is the same schema, one side filled in: `--save FILE` writes
+`ueia.compare/1` with every metric's baseline value and the `meta` block, and `--baseline FILE`
+compares a capture against one. A baseline committed under `goldens/` can therefore ratchet down as
+the tool's own numbers improve, instead of drifting up unnoticed; a file that is not a
+`ueia.compare/1` document is a usage error naming what is wrong with it, never a silently empty
+comparison.
+
+The two machine-facing forms are `--format json` (`ueia.compare/1`: `meta`, `verdict` with the
+threshold and the gated list, `breached`, `improved` and every metric with both sides and its delta)
+and `--format markdown`, which is the PR-comment shape: the verdict, a table of what moved with a
+`worse`/`better` column, what could not be compared, and a footer naming the schema and the gated
+metrics. The artefacts are deliberately compatible with Gauntlet/`AutomatedPerfTesting` runs — their
+`.utrace` is what we read and their `.csv` is what `ueia csv` wraps — and their *runner* is not
+reimplemented here (§9). `compare` takes two captures, so the corpus harness (README §4) cannot pin
+it: its transcripts pin one capture per command. It is exercised by hand against the registered
+captures instead, and by the self-diff test over `editor-pie-1`.

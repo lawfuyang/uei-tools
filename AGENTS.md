@@ -11,7 +11,7 @@ Any change to `src/py/` or `tests/` is not finished until all three pass:
 
 ```powershell
 python src\py\ueia.py lz4 --build       # step 0: bin/ueia_lz4.dll, built only when stale
-python src\py\ueia.py selftest          # the hermetic suite: ~120 s (the corpus half dominates), exit 0 pass / 1 fail / 2 bad option
+python src\py\ueia.py selftest          # the hermetic suite: ~160 s (the corpus half dominates), exit 0 pass / 1 fail / 2 bad option
 npx --yes pyright@latest                # must print: 0 errors, 0 warnings
 python src\py\ueia.py goldens --check   # the corpus: exit 0 matched / 1 a problem / 2 nothing to compare
 ```
@@ -51,7 +51,8 @@ percentiles and histograms a frame-time report is defined by) → `bottleneck` (
 on top of them: what bounds a frame) → `parallel` (the same measurements, asked who worked: solo
 work, simultaneity, contention) → `sources` (the spec table's file:line, mapped into engine vs
 project and cross-referenced with the engine's anti-pattern names) → `advice` (the rules over all of
-the above: ranked findings with evidence and the next command) → `tasks` (the task channel's
+the above: ranked findings with evidence and the next command) → `compare` (two models as named metrics, and the directional CI gate over them)
+→ `tasks` (the task channel's
 graph, its critical path, and the DOT/Mermaid exports) → `cache` (the parse cache) → `goldens`
 (the corpus harness) → `commands` (the commands and their rendering) → `ueia.py` (the CLI, which
 re-exports them all for scripts and tests).

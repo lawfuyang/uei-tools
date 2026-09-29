@@ -27,6 +27,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, cast
 import advice
 import bottleneck
 import cache
+import compare
 import container
 import csvprof
 import engine
@@ -64,6 +65,8 @@ _VALUE_OPTIONS = frozenset((
     "budget", "budget-ms",
     # and `advice`'s rule filter: a comma-separated list of rule ids to drop
     "skip",
+    # and `compare`'s gate, its saved baseline, and the file to save one to
+    "threshold", "baseline", "save",
     # the task graph's export form
     "graph",
     # the csv family: ours on the left, the exe's own flag in `_csv_*` below
@@ -558,6 +561,116 @@ def cmd_frames(capture: str, args: List[str]) -> int:
         prose,
     )
     return 0
+
+
+def _positional(args: Sequence[str]) -> Tuple[Optional[str], List[str]]:
+    """The first argument that is neither an option nor an option's value, and the rest of the line.
+
+    `compare` is the one command with a second positional (the capture to compare against), and this
+    is what keeps `--budget 30` from being read as it -- the same job `csv`'s own reader does, and
+    for the same reason.
+    """
+    found: Optional[str] = None
+    out: List[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg.startswith("--"):
+            name = arg[2:].split("=", 1)[0]
+            out.append(arg)
+            if "=" not in arg and name in _VALUE_OPTIONS and index + 1 < len(args):
+                index += 1
+                out.append(args[index])
+            index += 1
+            continue
+        if found is None:
+            found = arg
+        index += 1
+    return found, out
+
+
+def cmd_compare(capture: str, args: List[str]) -> int:
+    """`compare <before> <after> | <capture> --baseline FILE | <capture> --save FILE`: A/B, and a gate.
+
+    Two cached analyses reduced to the same named metrics and differenced section by section
+    (`compare.py` has the sections and the rules). The gate is the practice's: a candidate whose
+    **p99 is more than `--threshold` (10% by default) worse** fails -- exit 1, so a CI job can branch
+    on it -- while improvements are logged, never gated. `--baseline FILE` compares one capture
+    against a saved baseline and `--save FILE` writes one, which is how a rolling baseline under
+    `goldens/` ratchets down instead of drifting up.
+
+    Exit codes: 0 nothing worse than the threshold (or a baseline saved), 1 the gate failed, 2 a
+    usage error or nothing comparable, 1 a failure.
+    """
+    second, rest = _positional(args)
+    options = parse_options(rest)
+    if options.values.keys() - {"budget", "budget-ms", "tid", "threshold", "format", "jobs",
+                               "engine-dir", "baseline", "save"} or options.flags:
+        raise UsageError(
+            "compare takes a second capture (or --baseline FILE / --save FILE), then --budget, "
+            "--budget-ms, --tid, --threshold, --engine-dir, --format and --jobs"
+        )
+    budget = summary.parse_budget(options.values.get("budget"), options.values.get("budget-ms"))
+    threshold = options.number("threshold", int(compare.DEFAULT_THRESHOLD * 100)) / 100.0
+    if threshold < 0:
+        raise UsageError("--threshold takes a percentage (10 means 10%% worse), not a negative")
+    baseline_path = options.text("baseline")
+    save_path = options.text("save")
+    if not second and not baseline_path and not save_path:
+        raise UsageError("compare needs a second capture, --baseline FILE or --save FILE")
+    if second and baseline_path:
+        raise UsageError("compare takes a second capture or --baseline FILE, not both")
+    root, notes = _engine_dir(options)
+    view, model, _cached = load_model(capture, _jobs(options))
+    after_name = view.path.name
+    after_metrics, after_missing = compare.metrics(model, budget, root)
+    meta: Dict[str, object] = {
+        "tool_version": str(model.get("tool_version", "")),
+        "after": cache.capture_identity(Path(capture)),
+        "budget": {"label": budget.label(), "ms": budget.ms},
+        "threshold": threshold,
+        "engine_dir": str(root.root) if root is not None else "",
+        "gated": list(compare.GATED),
+    }
+    if save_path:
+        if second or baseline_path:
+            raise UsageError("--save writes a baseline, so it takes no second capture or baseline")
+        written = compare.save_baseline(save_path, after_metrics, meta)
+        sys.stdout.write("baseline  : %s written from %s (%d metric(s))\n"
+                         % (written, after_name, len(after_metrics)))
+        return 0
+
+    if baseline_path:
+        before_metrics, before_name = compare.load_baseline(baseline_path)
+        before_missing: List[str] = []
+        meta["before"] = {"baseline": baseline_path}
+    else:
+        other_view, other_model, _cached = load_model(second or "", _jobs(options))
+        before_metrics, before_missing = compare.metrics(other_model, budget, root)
+        before_name = other_view.path.name
+        meta["before"] = cache.capture_identity(Path(second or ""))
+    report = compare.compare(before_metrics, after_metrics, threshold, before_name, after_name,
+                             sorted(set(after_missing + before_missing)))
+
+    fmt = options.fmt() if options.text("format", "table") != JSON_FORMAT else JSON_FORMAT
+    if fmt == JSON_FORMAT:
+        sys.stdout.write(json.dumps(compare.document(report, meta), indent=2, sort_keys=True) + "\n")
+        return 0 if report.passed() else 1
+    if fmt == "markdown":
+        sys.stdout.write(compare.markdown(report, meta) + "\n")
+        return 0 if report.passed() else 1
+    lines = ["before    : %s" % (report.before,), "after     : %s" % (report.after,)]
+    lines.extend(notes)
+    prose, rows = compare.lines(report)
+    lines.extend(prose)
+    render_rows(
+        ("section", "metric", "what", "before -> after", "delta", "verdict"),
+        rows,
+        (False, False, False, False, True, False),
+        fmt,
+        lines,
+    )
+    return 0 if report.passed() else 1
 
 
 def cmd_advice(capture: str, args: List[str]) -> int:
@@ -1827,6 +1940,7 @@ __all__ = [
     "cmd_frames",
     "cmd_advice",
     "cmd_bottleneck",
+    "cmd_compare",
     "cmd_parallelism",
     "cmd_sources",
     "cmd_summary",

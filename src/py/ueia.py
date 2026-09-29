@@ -37,6 +37,12 @@ Commands:
                               and every absence said out loud (--budget, --budget-ms,
                               --tid, --limit; exit 2 when the capture has no frames, no
                               cycle frequency or no scopes)
+  compare <before> <after>    A/B of two captures, section by section, with the CI
+                              gate: worse than --threshold % (10 by default) on p99,
+                              p95, mean or hitches exits 1, improvements are logged.
+                              `<capture> --baseline FILE` compares against a saved
+                              baseline, `--save FILE` writes one, `--format json`
+                              and `--format markdown` are the PR/CI forms
   advice <capture>            what to do next: rule-based findings over the other
                               reports, ranked by impact/confidence/effort, each with
                               its evidence, its file:line and the next command to run
@@ -117,6 +123,7 @@ from timing import *  # noqa: F401,F403
 from commands import (
     cmd_advice,
     cmd_bottleneck,
+    cmd_compare,
     cmd_cache,
     cmd_csv,
     cmd_frames,
@@ -147,6 +154,7 @@ _CAPTURE_COMMANDS = {
     "frames": cmd_frames,
     "advice": cmd_advice,
     "bottleneck": cmd_bottleneck,
+    "compare": cmd_compare,
     "summary": cmd_summary,
     "parallelism": cmd_parallelism,
     "sources": cmd_sources,
