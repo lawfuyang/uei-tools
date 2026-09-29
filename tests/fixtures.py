@@ -416,6 +416,66 @@ def mapped_trace() -> bytes:
     )
 
 
+def calltree_importants() -> bytes:
+    """The specs `calltree_stream` uses: `FrameTime` (8), `WaitForTasks` (9), `WorkerTask` (10)."""
+    return parallel_importants()
+
+
+def calltree_stream() -> bytes:
+    """Three frames on tid 2 whose self time is *not* ordered like their duration.
+
+    One cycle is one microsecond (`NewTrace` declares 1,000,000), and every number below is meant to
+    be checkable by hand:
+
+    * **F0** spans 200 ms (1,000,000 to 1,200,000) and holds two `FrameTime` scopes: one that *began
+      before the frame did* (990,000 to 1,010,000, so only its last 10 ms are inside) and one that
+      ran 70 ms (1,020,000 to 1,090,000) with a 20 ms `WaitForTasks` inside it (1,030,000 to
+      1,050,000) which itself holds a 5 ms `WorkerTask` (1,035,000 to 1,040,000). The two `FrameTime`
+      scopes are siblings, so the report merges them: one node, 2 calls, 80 ms inclusive, and 60 ms
+      of self for the frame (10 from the straddler + 50 from the outer scope, since 20 of its 70 went
+      to the wait).
+    * **F1** spans 140 ms (1,200,000 to 1,340,000) -- the *longest* frame -- and holds a 20 ms
+      `WorkerTask` (1,210,000 to 1,230,000) plus the first 10 ms of a `FrameTime` that ends in F2.
+    * **F2** spans 100 ms (1,340,000 to 1,440,000) and holds the other 10 ms of that straddling
+      scope plus a 70 ms `FrameTime`: merged, 2 calls, 80 ms, and **80 ms of self** -- the most of
+      any frame here, while the longest frame has 30. A report that ranks by duration picks F1; one
+      that ranks by self picks F2, and that is the difference this fixture exists to pin.
+
+    It also carries one end with no begin and one begin that never closes, so the pass has to count
+    both rather than invent a pair for either.
+    """
+    records = [
+        (990000, 8, True),                             # FrameTime, begins before F0 does
+        (1010000, None, False),                        # ... and ends 10 ms inside it
+        (1020000, 8, True),                            # F0's own FrameTime, 70 ms
+        (1030000, 9, True),                            # WaitForTasks inside it, 20 ms
+        (1035000, 10, True),                           # WorkerTask inside *that*, 5 ms
+        (1040000, None, False),
+        (1050000, None, False),
+        (1090000, None, False),
+        (1210000, 10, True), (1230000, None, False),   # F1's 20 ms WorkerTask
+        (1330000, 8, True), (1350000, None, False),    # 20 ms FrameTime: 10 in F1, 10 in F2
+        (1360000, 8, True), (1430000, None, False),    # F2's own FrameTime, 70 ms
+        (1440000, None, False),                        # an end with no begin: counted, not invented
+        (1450000, 10, True),                           # a begin that never closes: counted too
+    ]
+    stream = parallel_records(records)
+    frames = b""
+    for serial, (begin, end) in enumerate(
+            ((1000000, 1200000), (1200000, 1340000), (1340000, 1440000)), start=1):
+        frames += event(22, pack("u64", begin) + pack("u8", 0), serial=serial * 2)
+        frames += event(23, pack("u64", end) + pack("u8", 0), serial=serial * 2 + 1)
+    return frames + stream
+
+
+def calltree_trace() -> bytes:
+    """A capture whose call tree and self times are hand-computed in `calltree_stream`."""
+    return build_trace(
+        events_stream=work_schema(), importants_stream=calltree_importants(),
+        threads={2: calltree_stream()},
+    )
+
+
 def parallel_schema() -> bytes:
     """`work_schema` plus a second thread's scopes: the vocabulary a parallelism report needs."""
     return work_schema()

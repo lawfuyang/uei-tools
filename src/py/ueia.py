@@ -37,6 +37,12 @@ Commands:
                               and every absence said out loud (--budget, --budget-ms,
                               --tid, --limit; exit 2 when the capture has no frames, no
                               cycle frequency or no scopes)
+  self <capture>              a frame's call tree: inclusive and self time per timer,
+                              the callee expansion, and any frame -- not only the ones
+                              the model keeps (--tid N, --frame INDEX, --limit N,
+                              --depth N). A second pass over that thread's streams,
+                              so it reports what the pass cost; exit 2 when the capture
+                              has no timer specs or no frame pair for that thread
   compare <before> <after>    A/B of two captures, section by section, with the CI
                               gate: worse than --threshold % (10 by default) on p99,
                               p95, mean or hitches exits 1, improvements are logged.
@@ -133,6 +139,7 @@ from commands import (
     cmd_parallelism,
     cmd_parse,
     cmd_schema,
+    cmd_self,
     cmd_selftest,
     cmd_sources,
     cmd_summary,
@@ -156,6 +163,7 @@ _CAPTURE_COMMANDS = {
     "bottleneck": cmd_bottleneck,
     "compare": cmd_compare,
     "summary": cmd_summary,
+    "self": cmd_self,
     "parallelism": cmd_parallelism,
     "sources": cmd_sources,
     "tasks": cmd_tasks,

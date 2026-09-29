@@ -120,8 +120,8 @@ CsvTools pipeline (README §2):
   Value)`.
 
 Corpus state: the definitions are present, the per-frame events are not — `editor-pie-1` ran
-with the CSV profiler *registered* but no CSV capture active (README §2; ROADMAP §9 wants a
-capture that has both). The engine's own reader of these events is
+with the CSV profiler *registered* but no CSV capture active (README §2; a capture that has both is
+still wanted). The engine's own reader of these events is
 `TraceServices\Private\Analyzers\CsvProfilerTraceAnalysis.cpp`, feeding the
 `CsvProfilerProvider` model.
 
@@ -272,7 +272,7 @@ A capture carries only what it was recorded with (`-trace=<id>,<id>...`; the mac
 channel are `UE_TRACE_CHANNEL*` in `Runtime\TraceLog\Public\Trace\Trace.h`). This is the inventory
 of what the engine can emit — gathered from the tree on 2026-09-28, grouped by the question it
 answers, with the engine analyser to mirror for field-level truth. **An absent channel is not a
-zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §5).
+zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §1).
 
 | Channel | Carries | Answers | Engine analyser to mirror |
 |---|---|---|---|
@@ -752,3 +752,77 @@ metrics. The artefacts are deliberately compatible with Gauntlet/`AutomatedPerfT
 reimplemented here (§9). `compare` takes two captures, so the corpus harness (README §4) cannot pin
 it: its transcripts pin one capture per command. It is exercised by hand against the registered
 captures instead, and by the self-diff test over `editor-pie-1`.
+
+## 17. The call tree and self time (`self`)
+
+The CPU root-cause step. `summary` answers *which timer owns this frame* from the inclusive cycles the
+walk keeps — enough to say "timer X owns 31% of frame 4121", but a scope's inclusive time includes
+everything it calls, so the timer to blame is often one level down; and the frame someone asks about
+is rarely one of the sixteen per thread the model keeps (`model._FRAME_WORK_KEEP`). `ueia self`
+builds the **nesting tree** instead: inclusive and **self** time per timer, the callee expansion at
+every level, top-N by self, and *any* frame of any thread.
+
+**The two questions the item left open, answered by measurement and by what the cache is for:**
+
+* **Self time must not come from the bounded sample.** The sample exists so a 100,000-frame capture
+  does not carry 100,000 trees; the point of this report is a frame nobody kept. So the tree is a
+  **second pass over that thread's streams** — seconds, paid only when this command runs, never by a
+  parse, and printed in the report's own `pass` line (`7.25 s` over `game-pc-2`'s tid 2, `17.48 s`
+  over `editor-pie-1`'s: 3,079,153 and 2,743,404 scope pairs).
+* **The tree is not in the cache.** A tree per frame for every frame of every thread would dwarf the
+  model (6.74 MB for the editor capture, §13), and every question this command answers is about *one*
+  frame. The cache keeps the answers the reports ask for; this is a different question, asked on
+  demand.
+
+**How a pair is placed, which is the one rule that matters here.** A scope is **present in every
+frame it overlaps**, clipped to each window, and its children *in a frame* are the pairs that closed
+inside it **in that frame** — a tree of intervals whose depth came from the wire. `self` is then the
+clip minus its children's clips, so the frame's self time is the sum over its roots, and the two
+agree by construction (`test_calltree` pins the invariant on the fixture and on a real capture).
+Siblings that name the same timer **merge**: one node with `calls` counting them, because "called 12
+times, 40 ms of it not in a callee" is what a reader wants, not twelve identical rows.
+
+That is deliberately **not** the model's work attribution, which credits a pair to the frame its
+*end* falls in (§13). The difference is real for a scope that straddles a boundary: in this tree it
+appears in both frames, clipped (the walk counts the same situation as `scope_pairs_spanning`); in
+the frame work attribution it appears once. Both rules are stated where their numbers are printed, and
+neither is presented as the other.
+
+**What it counts rather than invents.** An end with no begin, a begin that never closed, a pair
+outside every frame — each is a number in the `pairing` line, never a guessed pair (the editor
+capture has 5 unclosed begins out of 2,743,404 pairs; the game capture none).
+
+**The fixture, and what it caught.** `fixtures.calltree_stream` is three frames of one thread with
+every number hand-computable at 1 cycle = 1 microsecond, including the case that a naive ranking gets
+wrong: F1 is the **longest** frame (140 ms) and F2 the worst by **self** (80 ms against F1's 30 ms),
+so a report that ranks by duration picks F1. It also carries a scope that begins before F0 and closes
+inside it (only its last 10 ms are in F0), a scope that straddles F1 into F2 (10 ms in each tree,
+merged with F2's own 70 ms sibling), two merged `FrameTime` siblings, one end with no begin, and one
+begin that never closes. Three arithmetic bugs were found by that fixture before any capture was
+read: roots held once per frame the scope rooted in (a straddling scope was counted twice), a frame's
+list was summed across frames (siblings from another frame merged into this tree), and the first
+(monotonic-cursor) frame lookup lost the frames a pair *began* in when a long scope closed after a
+short one inside it.
+
+**What the corpus shows** (measured 2026-09-29; the frames are the ones with the most self time):
+
+| capture | frame | inside scopes | **self** | the tree's shape |
+|---|---|---|---|---|
+| `game-pc-2` (tid 2) | #0 | 905.104 ms | **2.003 ms** | `FEngineLoop::Tick` → `FlushRenderingCommands` 670.799 → **`GameThreadWaitForTask` 670.761 self**: the frame is *waiting*, not computing — an answer `summary` cannot give |
+| `game-pc-2` worst three | #0, #77, #50 | | 2.003 / 0.913 / 0.394 ms | |
+| `editor-pie-1` (tid 2) | #0 | 2,102.406 ms | **1,780.730 ms** | `FEngineLoop::Tick` holds the frame and almost all of it is self: an editor starting a PIE session is doing its own work |
+| `editor-pie-1` worst three | #0, #26, #50 | | 1,780.730 / 441.152 / 433.775 ms | |
+
+**Cost, and why it is not a golden transcript.** The pass is per thread and per run: 7.25 s over the
+game capture's tid 2, 17.48 s over the editor's, on top of the streams assembly the command needs
+(~0.3 s of it is the cached model the frame list comes from). Pinning it in the corpus harness would
+add that to `goldens --check` for every registered capture, so it is **not** in
+`goldens.PINNED_COMMANDS` — a decision, not an oversight: the harness pins commands whose cost is a
+fraction of a second, and the suite covers this one hermetically (the fixture, hand-computed) plus
+one real-capture invariant check.
+
+**What it cannot say.** Whether a scope *should* be split (that is `parallelism`'s measured ceiling,
+§13), what a timer whose name never reached the table is (`spec N`), and anything about a frame with
+no pair inside it (the tree is empty and the `pairing` line says the counts). Exit 0 a tree was built
+/ 2 the capture cannot answer — no `CpuProfiler` timer specs, no `Misc.BeginFrame` pair for the
+thread, or a `--frame` that thread does not have.

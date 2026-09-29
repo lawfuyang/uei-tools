@@ -27,11 +27,13 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, cast
 import advice
 import bottleneck
 import cache
+import calltree
 import compare
 import container
 import csvprof
 import engine
 import lz4
+import model
 import parallel
 import schema
 import sources
@@ -587,6 +589,87 @@ def _positional(args: Sequence[str]) -> Tuple[Optional[str], List[str]]:
             found = arg
         index += 1
     return found, out
+
+
+def cmd_self(capture: str, args: List[str]) -> int:
+    """`self <capture> [--tid N] [--frame INDEX] [--limit N] [--depth N]`: a frame's call tree.
+
+    The CPU root-cause report: inclusive **and self** time per timer, the callee expansion, and any
+    frame -- not only the sixteen the model keeps. It is the one command that reads the streams a
+    second time (`calltree`'s docstring says why: self time must not be a bounded sample, and a tree
+    per frame does not belong in a cache that is already 6.74 MB), and it prints what that pass cost.
+
+    Exit codes: 0 a tree was built, 2 the capture cannot answer (no CpuProfiler timer specs, no
+    `Misc.BeginFrame` pair for that thread, or a `--frame` this thread does not have), 1 a failure.
+    """
+    options = parse_options(args)
+    if options.values.keys() - {"tid", "frame", "limit", "depth", "format", "jobs"} \
+            or options.flags:
+        raise UsageError("self takes --tid, --frame, --limit, --depth, --format and --jobs")
+    limit = options.number("limit", _DEFAULT_BREAKER_LIMIT)
+    depth = options.number("depth", 6)
+    wanted = options.number("frame", -1)
+    chosen_tid = options.number("tid", -1)
+    view, model_doc, _cached = load_model(capture, _jobs(options))
+    if not model_doc.get("timers"):
+        sys.stdout.write(
+            "capture   : %s\ncannot    : the capture declares no CpuProfiler timer specs, so there "
+            "is no scope to nest\nhint      : record with -trace=cpu\n" % (view.path.name,))
+        return 2
+    series = bottleneck.pick_series(model_doc, None if chosen_tid < 0 else chosen_tid)
+    if series is None:
+        sys.stdout.write(
+            "capture   : %s\ncannot    : no Misc.BeginFrame/EndFrame pair%s, so there is no frame to "
+            "report on\nhint      : record with -trace=cpu,frame\n"
+            % (view.path.name, "" if chosen_tid < 0 else " on tid %d" % (chosen_tid,)))
+        return 2
+    with timing.timed("streams"):
+        stream_set = streams.assemble(view.data, view.packets)
+    stream = stream_set.streams.get(series.tid)
+    by_index = {int(row.get("index", 0)): row for row in series.rows}
+    if stream is None or (wanted >= 0 and wanted not in by_index):
+        sys.stdout.write("capture   : %s\ncannot    : %s\n" % (
+            view.path.name,
+            "this capture has no stream for tid %d" % (series.tid,) if stream is None
+            else "this thread has no frame #%d (it has %d)" % (wanted, len(series.rows))))
+        return 2
+    counts = model.zero_counts()
+    registry = schema.build_registry(stream_set.streams[0], [], counts)
+    names = {int(row.get("id", 0)): str(row.get("name", "")) for row in model_doc["timers"]}
+    started = time.monotonic()
+    trees, per_frame, pairs = calltree.stream_thread(
+        stream, series.tid, registry, counts, [], series.rows, names,
+        keep=_DEFAULT_BREAKER_LIMIT)
+    seconds = time.monotonic() - started
+    ranked = sorted(per_frame.items(), key=lambda item: (-item[1], item[0]))
+    chosen = wanted if wanted >= 0 else (ranked[0][0] if ranked else 0)
+    if chosen not in per_frame:
+        roots: List[calltree.Node] = []
+    else:
+        roots = trees.get(chosen, [])
+    frame_row = by_index.get(chosen, series.rows[0])
+    inclusive, own = calltree.totals(roots)
+    session = model_doc.get("session", {})
+    frequency = int(session.get("cycle_frequency", 0) or 0) if isinstance(session, dict) else 0
+    report = calltree.Report(
+        frame=frame_row, tid=series.tid, frequency=frequency, roots=roots,
+        top=calltree.top_by_self(roots, limit), total_inclusive=inclusive, total_self=own,
+        pairs=pairs, ends_unpaired=counts.get("ends_unpaired", 0),
+        begins_unpaired=counts.get("begins_unpaired", 0), seconds=seconds,
+        frame_self=[(by_index[index], count) for index, count in ranked[:3] if index in by_index],
+    )
+    lines = ["capture   : %s" % (view.path.name,),
+             "thread    : tid %d, %s" % (series.tid, series.describe())]
+    prose, rows = calltree.render_lines(report, limit, depth)
+    lines.extend(prose)
+    render_rows(
+        ("timer", "self ms", "inclusive ms", "calls", "callees"),
+        rows,
+        (False, True, True, True, False),
+        options.fmt(),
+        lines,
+    )
+    return 0
 
 
 def cmd_compare(capture: str, args: List[str]) -> int:
@@ -1942,6 +2025,7 @@ __all__ = [
     "cmd_bottleneck",
     "cmd_compare",
     "cmd_parallelism",
+    "cmd_self",
     "cmd_sources",
     "cmd_summary",
     "cmd_tasks",

@@ -63,7 +63,8 @@ measurement every thread's timeline is folded into) → `model` (the session mod
 per-frame work attribution, the occupancy and the coverage timelines) → `summary` (the budget,
 percentiles and histograms a frame-time report is defined by) → `bottleneck` (the classification
 on top of them: what bounds a frame) → `parallel` (the same measurements, asked who worked: solo
-work, simultaneity, contention) → `sources` (the spec table's file:line, mapped into engine vs
+work, simultaneity, contention) → `calltree` (the nesting tree and **self** time, built from the
+pairs in a second pass over one thread) → `sources` (the spec table's file:line, mapped into engine vs
 project and cross-referenced with the engine's anti-pattern names) → `advice` (the rules over all of
 the above: ranked findings with evidence and the next command) → `compare` (two models as named metrics, and the directional CI gate over them)
 → `tasks` (the task channel's
@@ -135,7 +136,7 @@ without `gpu` cannot answer a GPU question, one without `memtag`/`memalloc` cann
 question, and one without `task` cannot show a critical path. An analysis whose channel is missing
 reports **skipped** with the re-record line, never zero, never a default and never a guess — the
 same rule as the corpus half's exit 2, one level down. Every analysis that lands says in its tests
-what it does with its channel absent, and `coverage` (ROADMAP §5) is the one command that has to
+what it does with its channel absent, and `coverage` (ROADMAP §1) is the one command that has to
 get this right for all of them at once.
 
 ## Parallel work (the one place processes are used)
@@ -240,10 +241,17 @@ suite's real numbers — test count, pass/fail, pyright errors — not "passes".
   one), and an absent input stays absent — a capture records no core count, so oversubscription is
   "cannot be judged here", and a lock whose name the heuristic does not recognise is "invisible",
   never "no contention". The same shape as the bottleneck's rule about a missing GPU channel.
+* **A second pass over the streams says what it cost.** `ueia self` is the one command that reads a
+  thread's streams again — the model keeps only the longest frames per thread, so "this frame's
+  self time" cannot come from the sample, and a tree per frame for every frame would dwarf the cache
+  (6.74 MB for the corpus's editor capture). It therefore prints its own `pass` line (7.25 s over the
+  game capture's tid 2, 17.48 s over the editor's, once per run) and is deliberately **not** in
+  `goldens.PINNED_COMMANDS`: the harness pins commands that cost a fraction of a second, and the
+  gate's runtime is a feature. What keeps it honest instead is the fixture whose tree is
+  hand-computable at 1 cycle = 1 microsecond, plus one real-capture invariant check.
 * **Never sum inclusive cycles across scopes.** The model's per-frame work is inclusive (a scope
   counts its children), so adding it up per file, module or pattern produces a number no frame ever
-  contained — measured: `Runtime/CoreUObject` sums to 306,239 s of a 332 s capture. Anything that
-  aggregates a group of timers takes **the biggest match inside each frame and sums those across
+  contained — measured: `Runtime/CoreUObject` sums to 306,239 s of a 332 s capture. Anything that  aggregates a group of timers takes **the biggest match inside each frame and sums those across
   frames** (`sources.Weights.presence`), which is bounded by the frames' own span and is a lower
   bound on the group's presence. A share that cannot exceed 100% is the point; the call tree
   (ROADMAP, self time) is what will make the other question answerable.
