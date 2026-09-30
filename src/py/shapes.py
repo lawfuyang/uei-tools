@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypedDict
 
 TOOL_NAME = "ueia"
 #: 0.2.0 added `frame_work` to the model (the per-frame work attribution the summary reports).
@@ -17,8 +17,11 @@ TOOL_NAME = "ueia"
 #: measurement (`thread_spans`, `frame_occupancy`): who was working inside each frame, and for how
 #: long, which is what the parallelism report reads. The cache is keyed by this string, so the bump
 #: is what stops a model built by an older version, which has none of those, from being read back
-#: and reported as a capture where no other thread ever worked.
-TOOL_VERSION = "0.4.0"
+#: and reported as a capture where no other thread ever worked. 0.5.0 added the per-frame **self
+#: time** the walk measures (`FrameRow.self_cycles`) and the call trees `ueia self` keeps for the
+#: frames it reports on (`FrameRow.self_detail`): a model without them has no frame ranking and no
+#: tree, so reading it back would send the same command to the streams again.
+TOOL_VERSION = "0.5.0"
 CACHE_FORMAT = 1
 
 MAGIC = b"2CRT"
@@ -257,6 +260,31 @@ class FrameRow(TypedDict):
     end_cycle: int
     covered_cycles: Optional[int]
     wait_cycles: Optional[int]
+    #: This thread's **self time** inside the frame: the cycles of the scopes the walk attributed to
+    #: it (by the end of each pair, clipped at the frame's begin -- REFERENCE §13's rule) minus the
+    #: cycles of the pairs that closed inside them *in this frame*. Measured during the walk, which is
+    #: what lets `ueia self` rank a capture's frames out of the cache instead of decoding every thread
+    #: again; None for a capture with no timer specs, like the two above.
+    self_cycles: Optional[int]
+    #: The frame's **call tree**, kept for the frames `ueia self` reports on and None for every other
+    #: one: the worst few by self time per thread, plus any frame a run asked for by name. A tree per
+    #: frame would dwarf the model (REFERENCE §17), so this is a bounded sample -- and `self` says
+    #: which frame came from it. Absent until a `self` run has built it, which is why the first run
+    #: over a capture still reads the streams.
+    self_detail: Optional["SelfDetail"]
+
+
+class SelfDetail(TypedDict):
+    """One frame's call tree, so `self` can answer without a second read of that thread's streams.
+
+    `tree` is the nodes the pass built, as plain JSON: `[spec, inclusive_cycles, calls, [children]]`
+    per node, siblings that name the same timer already merged into one node with `calls` counting
+    them. `self` is **not** stored: it is `inclusive` minus the children's -- exactly how the pass
+    computes it (`calltree.materialise`) -- so it is recomputed on load and cannot disagree with the
+    tree it belongs to. `calltree.pack_tree` writes this and `calltree.load_tree` reads it back.
+    """
+
+    tree: List[Any]
 
 
 class TaskEventRow(TypedDict):

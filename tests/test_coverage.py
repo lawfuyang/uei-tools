@@ -20,7 +20,8 @@ from shapes import FrameRow
 def frame(index: int, tid: int, begin: int, end: int, kind: int = 0) -> FrameRow:
     """A frame row as `build_model` makes one (occupancy columns are the walk's own business)."""
     return FrameRow(index=index, type=kind, tid=tid, begin_cycle=begin, end_cycle=end,
-                    covered_cycles=None, wait_cycles=None)
+                    covered_cycles=None, wait_cycles=None,
+                    self_cycles=None, self_detail=None)
 
 
 def spans(*pairs: Tuple[int, int]) -> bytes:

@@ -698,6 +698,22 @@ class TestTheCoverageTimeline(UeiaTestCase):
             self.assertEqual(bool(own), covered > 0,
                              "a frame the thread covered has its own row, and one it did not has none")
 
+    def test_the_walk_measures_each_frame_self_time(self) -> None:
+        """The three frames' self time, hand-computed in `fixtures.calltree_stream`: 60 / 20 / 80 ms.
+
+        Measured **during the walk**, which is what lets `ueia self` rank a capture's frames out of
+        the cache instead of decoding every thread again. Roots only: a nested pair's own time is
+        already inside its parent's, so crediting every pair would telescope into the roots'
+        *inclusive* total (the corpus caught exactly that -- 816.21 ms against the pass's 815.38 on
+        its frame 52, 2026-09-30).
+        """
+        from fixtures import calltree_trace
+
+        model = self._model(calltree_trace())
+        rows = [row for row in model["frames"] if row.get("self_cycles") is not None]
+        self.assertEqual([(int(row["index"]), int(row["self_cycles"] or 0)) for row in rows],
+                         [(0, 60000), (1, 20000), (2, 80000)])
+
     def test_the_timelines_are_not_kept_in_the_model(self) -> None:
         """Only the measurement is cached: 780 k intervals would not fit a JSON cache."""
         model = self._model(work_trace())

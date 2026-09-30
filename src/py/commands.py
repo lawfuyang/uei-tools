@@ -93,6 +93,10 @@ _DEFAULT_THREAD_LIMIT = 20
 #: How many over-budget frames `summary` lists by default. Ten fits a page and is the worst of the
 #: tail, which is what the practice says to look at; `--limit 0` asks for every one of them.
 _DEFAULT_BREAKER_LIMIT = 10
+#: How many frames' call trees `ueia self` stores per thread: the worst by self time, plus whatever
+#: `--frame` names. A tree per frame would dwarf the model (REFERENCE §17); this is enough that the
+#: frames a report actually names -- the worst ones -- are answered from the model after one pass.
+_SELF_DETAIL_KEEP = 3
 #: How many source files `sources` lists by default: a page of the files that own the most work.
 _DEFAULT_FILE_LIMIT = 40
 _MAX_LISTED_ANOMALIES = 40
@@ -595,9 +599,12 @@ def cmd_self(capture: str, args: List[str]) -> int:
     """`self <capture> [--tid N] [--frame INDEX] [--limit N] [--depth N]`: a frame's call tree.
 
     The CPU root-cause report: inclusive **and self** time per timer, the callee expansion, and any
-    frame -- not only the sixteen the model keeps. It is the one command that reads the streams a
-    second time (`calltree`'s docstring says why: self time must not be a bounded sample, and a tree
-    per frame does not belong in a cache that is already 6.74 MB), and it prints what that pass cost.
+    frame -- not only the sixteen the model keeps. Self time comes from the walk (`self_cycles`), so
+    the ranking costs nothing; the **tree** is the expensive part, and it is read out of the streams
+    **once per capture**: the worst frames per thread are unpacked into the model beside the capture
+    (`FrameRow.self_detail`) and every later run answers from them. That pass is the report's only
+    cost, it is paid at most once, and what it cost goes to stderr (`timing`), never into the output
+    -- `cache.py`'s rule is that no command may say whether it was warm.
 
     Exit codes: 0 a tree was built, 2 the capture cannot answer (no CpuProfiler timer specs, no
     `Misc.BeginFrame` pair for that thread, or a `--frame` this thread does not have), 1 a failure.
@@ -623,40 +630,67 @@ def cmd_self(capture: str, args: List[str]) -> int:
             "report on\nhint      : record with -trace=cpu,frame\n"
             % (view.path.name, "" if chosen_tid < 0 else " on tid %d" % (chosen_tid,)))
         return 2
-    with timing.timed("streams"):
-        stream_set = streams.assemble(view.data, view.packets)
-    stream = stream_set.streams.get(series.tid)
     by_index = {int(row.get("index", 0)): row for row in series.rows}
-    if stream is None or (wanted >= 0 and wanted not in by_index):
-        sys.stdout.write("capture   : %s\ncannot    : %s\n" % (
-            view.path.name,
-            "this capture has no stream for tid %d" % (series.tid,) if stream is None
-            else "this thread has no frame #%d (it has %d)" % (wanted, len(series.rows))))
+    if wanted >= 0 and wanted not in by_index:
+        sys.stdout.write(
+            "capture   : %s\ncannot    : this thread has no frame #%d (it has %d)\n"
+            % (view.path.name, wanted, len(series.rows)))
         return 2
-    counts = model.zero_counts()
-    registry = schema.build_registry(stream_set.streams[0], [], counts)
-    names = {int(row.get("id", 0)): str(row.get("name", "")) for row in model_doc["timers"]}
-    started = time.monotonic()
-    trees, per_frame, pairs = calltree.stream_thread(
-        stream, series.tid, registry, counts, [], series.rows, names,
-        keep=_DEFAULT_BREAKER_LIMIT)
-    seconds = time.monotonic() - started
-    ranked = sorted(per_frame.items(), key=lambda item: (-item[1], item[0]))
-    chosen = wanted if wanted >= 0 else (ranked[0][0] if ranked else 0)
-    if chosen not in per_frame:
-        roots: List[calltree.Node] = []
-    else:
-        roots = trees.get(chosen, [])
+    # The worst frames by the **self time the walk measured**: naming them needs no streams, and the
+    # pass agrees with this ranking frame by frame (`test_calltree` pins that on a real capture).
+    ranked = sorted(((int(row.get("self_cycles") or 0), int(row.get("index", 0)))
+                     for row in series.rows), key=lambda item: (-item[0], item[1]))
+    chosen = wanted if wanted >= 0 else (ranked[0][1] if ranked else 0)
     frame_row = by_index.get(chosen, series.rows[0])
+    names = {int(row.get("id", 0)): str(row.get("name", "")) for row in model_doc["timers"]}
+    if frame_row.get("self_detail") is None:
+        # Not stored for this frame: read that thread's streams, keep the frames that count -- the
+        # worst `_SELF_DETAIL_KEEP` and the one asked for, whatever its rank -- and store them.
+        with timing.timed("streams"):
+            stream_set = streams.assemble(view.data, view.packets)
+        stream = stream_set.streams.get(series.tid)
+        if stream is None:
+            sys.stdout.write("capture   : %s\ncannot    : this capture has no stream for tid %d\n"
+                             % (view.path.name, series.tid))
+            return 2
+        counts = model.zero_counts()
+        registry = schema.build_registry(stream_set.streams[0], [], counts)
+        with timing.timed("self-trees"):
+            started = time.monotonic()
+            trees, _per_frame, pairs = calltree.stream_thread(
+                stream, series.tid, registry, counts, [], series.rows, names,
+                keep=_SELF_DETAIL_KEEP, want=chosen)
+            seconds = time.monotonic() - started
+        for index, kept_roots in trees.items():
+            row = by_index.get(index)
+            if row is not None:
+                row["self_detail"] = {"tree": calltree.pack_tree(kept_roots)}
+        pairing_doc = dict(model_doc.get("self_pairing") or {})
+        pairing_doc[str(series.tid)] = {
+            "pairs": pairs, "ends_unpaired": counts.get("ends_unpaired", 0),
+            "begins_unpaired": counts.get("begins_unpaired", 0)}
+        model_doc["self_pairing"] = pairing_doc
+        if not cache.disabled():
+            cache.store(view.path, cache.capture_identity(view.path), dict(model_doc))
+        timing.progress("self: read %s's tid %d streams again in %.2f s (self time is not a bounded "
+                        "sample); stored the %d worst frame tree(s) and #%d"
+                        % (view.path.name, series.tid, seconds, len(trees), wanted))
+    detail = frame_row.get("self_detail") or {"tree": []}
+    roots: List[calltree.Node] = calltree.load_tree(detail["tree"], names)
+    pairing = (model_doc.get("self_pairing") or {}).get(str(series.tid)) or {}
     inclusive, own = calltree.totals(roots)
     session = model_doc.get("session", {})
     frequency = int(session.get("cycle_frequency", 0) or 0) if isinstance(session, dict) else 0
     report = calltree.Report(
         frame=frame_row, tid=series.tid, frequency=frequency, roots=roots,
         top=calltree.top_by_self(roots, limit), total_inclusive=inclusive, total_self=own,
-        pairs=pairs, ends_unpaired=counts.get("ends_unpaired", 0),
-        begins_unpaired=counts.get("begins_unpaired", 0), seconds=seconds,
-        frame_self=[(by_index[index], count) for index, count in ranked[:3] if index in by_index],
+        pairs=int(pairing.get("pairs", 0)),
+        ends_unpaired=int(pairing.get("ends_unpaired", 0)),
+        begins_unpaired=int(pairing.get("begins_unpaired", 0)),
+        tree_source="the model's stored detail for this frame: the %d worst frames by *self* time "
+                    "per thread, plus any frame a run asked for by name -- another index reads that "
+                    "thread's streams again" % (_SELF_DETAIL_KEEP,),
+        frame_self=[(by_index[index], count) for count, index in ranked[:3]],
     )
     lines = ["capture   : %s" % (view.path.name,),
              "thread    : tid %d, %s" % (series.tid, series.describe())]

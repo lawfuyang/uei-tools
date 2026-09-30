@@ -263,8 +263,17 @@ suite's real numbers — test count, pass/fail, pyright errors — not "passes".
   (6.74 MB for the corpus's editor capture). It therefore prints its own `pass` line (7.25 s over the
   game capture's tid 2, 17.48 s over the editor's, once per run) and is deliberately **not** in
   `goldens.PINNED_COMMANDS`: the harness pins commands that cost a fraction of a second, and the
-  gate's runtime is a feature. What keeps it honest instead is the fixture whose tree is
-  hand-computable at 1 cycle = 1 microsecond, plus one real-capture invariant check.
+  gate's runtime is a feature. It is paid **once per capture** -- the trees are stored with the model
+  (`FrameRow.self_detail`) and every later run answers from them (4.86 s then 0.27 s on the game
+  capture, 12.33 s then 0.38 s on the editor's, byte-identical both times), and the seconds go to
+  stderr under `$UEI_PROGRESS`, never into the report: `cache.py`'s rule is that no command's output
+  may say whether it was warm, and a report that cited the pass's seconds would change between two
+  runs of the same command on the same capture. What keeps it honest instead is the fixture whose tree is
+  hand-computable at 1 cycle = 1 microsecond, plus one real-capture invariant check — and, since
+  2026-09-30, a **frame-by-frame comparison with the walk's own measurement** (`FrameRow.self_cycles`,
+  credited during the parse by the same rule and the same promotion): two independent decodes of one
+  capture must produce one answer, and the test says so on the game capture. Anything that changes how
+  either side credits self time has to keep them equal.
 * **Never sum inclusive cycles across scopes.** The model's per-frame work is inclusive (a scope
   counts its children), so adding it up per file, module or pattern produces a number no frame ever
   contained — measured: `Runtime/CoreUObject` sums to 306,239 s of a 332 s capture. Anything that  aggregates a group of timers takes **the biggest match inside each frame and sums those across

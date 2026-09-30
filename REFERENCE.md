@@ -769,10 +769,16 @@ every level, top-N by self, and *any* frame of any thread.
   **second pass over that thread's streams** — seconds, paid only when this command runs, never by a
   parse, and printed in the report's own `pass` line (`7.25 s` over `game-pc-2`'s tid 2, `17.48 s`
   over `editor-pie-1`'s: 3,079,153 and 2,743,404 scope pairs).
-* **The tree is not in the cache.** A tree per frame for every frame of every thread would dwarf the
-  model (6.74 MB for the editor capture, §13), and every question this command answers is about *one*
-  frame. The cache keeps the answers the reports ask for; this is a different question, asked on
-  demand.
+* **The tree *is* in the cache now, but only for the frames this command reports on** (`FrameRow.self_detail`:
+  the worst few by self time per thread, `_SELF_DETAIL_KEEP`, plus any frame a run names with
+  `--frame`). A tree per frame for every frame of every thread would dwarf the model (6.74 MB for the
+  editor capture, §13), so this is a bounded sample of the trees that get asked for -- and `self` says
+  on every run which frame it served and what the model keeps, so the reader is never guessing
+  whether the report came out of the cache. The first run over a capture pays for the pass; every run
+  after it reads the stored detail, and **the report is rendered from the stored detail either way**,
+  which is what makes a warm run and a cold run print the same lines (`cache.py`: no command's output
+  may say whether it was warm; `test_calltree` runs `self` twice on a capture and compares byte for
+  byte).
 
 **How a pair is placed: the model's own rule, one frame per pair.** A scope belongs to the frame that
 holds its **end** (the first frame with `end >= cycle`, the test `model`'s cursor makes) and is
@@ -829,11 +835,32 @@ the game capture's tid 2 and **9.64 s** over the editor's, on top of the streams
 needs (~0.3 s of it is the cached model the frame list comes from). Both fell when the rule became
 the model's — 7.25 s and 17.48 s before it — because the per-pair clipping the overlap rule needed is
 gone; what is left is the decode the format forces (each thread's records are delta-encoded, so no
-pass can skip any of them). Pinning it in the corpus harness would
+pass can skip any of them). It is paid **once per capture**, because the trees it builds are stored
+in the model (`FrameRow.self_detail`): 4.86 s on this capture's first `self` run and 0.27 s on the
+second, byte-identical output (12.33 s to 0.38 s on the editor capture, measured 2026-09-30).
+Pinning it in the corpus harness would
 add that to `goldens --check` for every registered capture, so it is **not** in
 `goldens.PINNED_COMMANDS` — a decision, not an oversight: the harness pins commands whose cost is a
 fraction of a second, and the suite covers this one hermetically (the fixture, hand-computed) plus
 one real-capture invariant check.
+
+**Self time is measured twice, and the two must agree.** The walk credits every frame's self time
+during the parse (`FrameRow.self_cycles`): the same rule as this pass (a pair belongs to the frame
+holding its end, clipped at that frame's begin), and the same promotion — a pair still open when a
+window is flushed releases what it holds for that frame, because the children it collected there are
+that frame's roots. That promotion forced an ordering that is easy to get wrong and was: the flush
+must run **before the pair is popped**. A scope that closes in the *gap* between two frames (or after
+the last one) is not in any frame, so it credits nothing itself — but its slot held its children's own
+time, and popping it first threw that time away. The corpus showed it as `covered=8980608` at the
+flush of the game capture's frame 0 with `sum(child_own)=0`, and the fix is what makes the walk's
+numbers match this pass's: `test_calltree` compares them **frame by frame** on the real capture, and
+they agree to the millisecond (815.384 / 177.750 / 164.073 ms as the worst three).
+
+What the cached number is for, and what it is not: it is **one integer per frame**, so `self` names the
+worst frames without decoding anything again, and the *reading* of the streams that builds their trees
+happens **once per capture** — those trees are then stored in the model (above) and every later run
+renders from them. Measured 2026-09-30 on the game capture: 4.86 s for the first run, **0.27 s** for
+the second, byte-identical output.
 
 **What it cannot say.** Whether a scope *should* be split (that is `parallelism`'s measured ceiling,
 §13), what a timer whose name never reached the table is (`spec N`), and anything about a frame with

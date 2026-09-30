@@ -38,7 +38,8 @@ def _model(data: bytes) -> Dict[str, Any]:
 def _frame(index: int, tid: int, begin: int, end: int, frame_type: int = 0,
            covered: Optional[int] = None, wait: Optional[int] = None) -> FrameRow:
     return FrameRow(index=index, type=frame_type, tid=tid, begin_cycle=begin, end_cycle=end,
-                    covered_cycles=covered, wait_cycles=wait)
+                    covered_cycles=covered, wait_cycles=wait,
+                    self_cycles=None, self_detail=None)
 
 
 def _no_frames_trace() -> bytes:

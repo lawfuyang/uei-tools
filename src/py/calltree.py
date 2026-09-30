@@ -36,7 +36,7 @@ so memory is bounded by the frames being reported, not by the capture.
 from __future__ import annotations
 
 import bisect
-from typing import Any, Dict, List, Mapping, NamedTuple, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import decode
 import events
@@ -68,7 +68,12 @@ class Report(NamedTuple):
     pairs: int
     ends_unpaired: int
     begins_unpaired: int
-    seconds: float
+    #: One line saying **where the tree came from** -- the model's stored detail for this frame, or a
+    #: second read of the streams because this frame is not one of the trees the model keeps. It is a
+    #: property of the capture and the frame asked for, never of whether the parse cache was warm
+    #: (`cache.py`: no command's output may say that), and the seconds a second read took go to
+    #: stderr where `timing` keeps them.
+    tree_source: str
     frame_self: List[Tuple[FrameRow, int]]
 
 
@@ -126,6 +131,33 @@ def self_of(entries: Sequence[Pair], frame: int) -> int:
                for entry in entries)
 
 
+def pack_tree(roots: Sequence[Node]) -> List[Any]:
+    """A tree as plain JSON -- `[spec, inclusive, calls, [children]]` -- for `FrameRow.self_detail`.
+
+    Siblings are already merged by `materialise`, so the tree is the whole shape and nothing else
+    needs storing. `self` is left out on purpose: it is `inclusive` minus the children's, which is
+    how the pass computed it, and a number that can be recomputed cannot disagree with the tree that
+    carries it.
+    """
+    return [[node.spec, node.inclusive, node.calls, pack_tree(node.children)] for node in roots]
+
+
+def load_tree(rows: Sequence[Any], names: Mapping[int, str]) -> List[Node]:
+    """The inverse of `pack_tree`: the nodes the pass built, with `self` recomputed as it was.
+
+    `names` is the model's timer table, so a stored tree renders with the labels the pass gave it.
+    """
+    out: List[Node] = []
+    for row in rows:
+        spec, inclusive, calls = int(row[0]), int(row[1]), int(row[2])
+        children = load_tree(row[3], names)
+        out.append(Node(spec=spec, name=str(names.get(spec, "")) if spec >= 0 else "", calls=calls,
+                        inclusive=inclusive,
+                        self=max(0, inclusive - sum(child.inclusive for child in children)),
+                        children=children))
+    return out
+
+
 def top_by_self(roots: Sequence[Node], limit: int) -> List[Node]:
     """The biggest nodes in a tree by **self** time, biggest first."""
     flat: List[Node] = []
@@ -147,7 +179,7 @@ def totals(roots: Sequence[Node]) -> Tuple[int, int]:
 
 def stream_thread(stream: bytes, tid: int, registry: "schema.SchemaRegistry",
                   counts: Dict[str, int], anomalies: List[Any], frames: Sequence[FrameRow],
-                  names: Mapping[int, str], keep: int = 3,
+                  names: Mapping[int, str], keep: int = 3, want: Optional[int] = None,
                   ) -> Tuple[Dict[int, List[Node]], Dict[int, int], int]:
     """One pass over one thread: `(the kept frames' trees, self cycles per frame, pairs paired)`.
 
@@ -155,6 +187,10 @@ def stream_thread(stream: bytes, tid: int, registry: "schema.SchemaRegistry",
     rest), and a frame is weighed as soon as no open pair can still add to it -- which is what keeps
     memory bounded by the frames being reported. Every pair's clip is credited to every frame it
     overlaps, so a scope that straddles a boundary appears in both frames' trees, clipped.
+
+    `want` is a frame to keep *whatever* its rank, for a caller that was asked about that frame by
+    name: `ueia self --frame 999` must report on 999 even when every other frame is worse, and the
+    model stores the trees it is given (`FrameRow.self_detail`), so the answer outlives the run.
     """
     windows = [(int(row.get("index", 0)), int(row.get("begin_cycle", 0)),
                 int(row.get("end_cycle", 0))) for row in frames]
@@ -182,7 +218,7 @@ def stream_thread(stream: bytes, tid: int, registry: "schema.SchemaRegistry",
         keepers.sort(reverse=True)
         while len(keepers) > keep:
             trees.pop(keepers.pop()[1], None)
-        if any(entry_index == index for _own, entry_index in keepers):
+        if index == want or any(entry_index == index for _own, entry_index in keepers):
             trees[index] = materialise(mine, index, names)
 
     for event in events.iter_thread_events(stream, tid, registry, anomalies, counts):
@@ -285,9 +321,7 @@ def render_lines(report: Report, limit: int = 12, depth: int = 6) -> Tuple[List[
         lines.append("worst     : by *self* time across this thread's frames: %s" % (
             ", ".join("#%d %.3f ms" % (int(row.get("index", 0)), parallel.ms(count, frequency))
                       for row, count in report.frame_self),))
-    lines.append("pass      : %.2f s over the streams -- this report reads them a second time, "
-                 "because self time must not be a bounded sample and a tree per frame does not "
-                 "belong in the cache" % (report.seconds,))
+    lines.append("tree      : %s" % (report.tree_source,))
     lines.append("tree      : inclusive / self, flat at every level")
     for node in report.roots:
         _render_node(lines, node, frequency, 12, depth)

@@ -175,8 +175,12 @@ class SessionModel(TypedDict):
     """Everything the parser core knows about one capture. JSON-serialisable.
 
     `build_model` fills every key, and a cached model is the same document
-    read back, so the type is total; a caller that deliberately wants a
-    partial one (a test of `seconds_for_cycle`, say) casts it.
+    read back, so the type is total -- with one exception, `self_pairing`:
+    the call trees `ueia self` stores and the pass's own pairing counts for
+    the threads it was asked about (`FrameRow.self_detail`) are added by that
+    command, after the parse, and are absent until it runs. A caller that
+    deliberately wants a partial model (a test of `seconds_for_cycle`, say)
+    casts it.
     """
 
     tool_version: str
@@ -188,6 +192,9 @@ class SessionModel(TypedDict):
     timers: List[TimerRow]
     frames: List[FrameRow]
     frame_work: List[FrameWorkRow]
+    #: Per thread id, the pairing counts of the self pass that built the frames stored trees.
+    #: Written by that command, not by build_model: absent until a run has read that thread.
+    self_pairing: Dict[str, Any]
     thread_spans: List[ThreadSpanRow]
     frame_occupancy: List[FrameOccupancyRow]
     gpu_specs: List[GpuSpecRow]
@@ -335,7 +342,7 @@ class _Window(object):
     does.
     """
 
-    __slots__ = ("type", "begin", "end", "covered", "waiting", "pairs", "totals")
+    __slots__ = ("type", "begin", "end", "covered", "waiting", "pairs", "totals", "self_cycles")
 
     def __init__(self, frame_type: int, begin: int, end: int) -> None:
         self.type = frame_type
@@ -344,6 +351,11 @@ class _Window(object):
         self.covered = 0
         self.waiting = 0
         self.pairs = 0
+        # this thread's self time inside the frame: the clips of the scopes attributed to it, minus
+        # the clips of the pairs that closed inside them *here* (`FrameRow.self_cycles`). One integer
+        # per frame, which is what lets `ueia self` rank a capture's frames out of the cache instead
+        # of decoding every thread again.
+        self.self_cycles = 0
         # one slot per spec id: a list, not a dict, because the hot loop writes it once per scope
         # pair (2.5 M of them on the corpus's game thread) and an index beats a hash there. Only a
         # thread's longest frames have one at all.
@@ -367,13 +379,17 @@ class _Window(object):
         covered: Optional[int] = self.covered if occupancy else None
         waiting: Optional[int] = self.waiting if occupancy else None
         return FrameRow(
-            index=0, type=self.type, tid=tid, begin_cycle=self.begin, end_cycle=self.end,
-            covered_cycles=covered, wait_cycles=waiting,
+        index=0, type=self.type, tid=tid, begin_cycle=self.begin, end_cycle=self.end,
+        covered_cycles=covered, wait_cycles=waiting,
+        self_cycles=self.self_cycles if occupancy else None,
+        # the walk does not build trees: `ueia self` stores the few it reports on, into this very row
+        self_detail=None,
         )
 
 
 def _flush_window(window: _Window, occupancy: List[int], pairs: int) -> None:
-    """Write the hot loop's running occupancy and pair count into the window they belong to."""
+    """Write the hot loop's running occupancy, self time and pair count into the window they are."""
+    window.self_cycles = occupancy[2]
     window.covered = occupancy[0]
     window.waiting = occupancy[1]
     window.pairs = pairs
@@ -522,6 +538,16 @@ def _walk_tid(
     active = -1
     covered = 0
     waiting = 0
+    #: the running self time of the window being filled, and -- in lockstep with `stack` -- how much
+    #: of each open pair's span is already its children's. Both are reset when the window changes: a
+    #: child that closed in the previous window is that window's, and must not be subtracted from its
+    #: parent's self time here.
+    window_self = 0
+    child_stack: List[int] = []
+    #: the own time of each open pair's children in this window, held until the frame is
+    #: flushed: if the pair is still open then, it belongs to a later frame and those children
+    #: are this frame's roots (the promotion `calltree.weigh` does for the pass)
+    child_own: List[int] = []
     cover_start = 0
     cover_end = -1
     wait_start = 0
@@ -601,10 +627,27 @@ def _walk_tid(
                     first_cycle = cycle
                 if not occupancy_on:
                     continue
+                # The window whose span holds this record's cycle: the cursor only ever moves forward,
+                # because the records arrive in cycle order. **This runs before the pair is popped**,
+                # and that ordering is the whole point: a pair that closes beyond a window -- in the
+                # gap between two frames, after the last frame, or in a later frame -- is not in that
+                # window, but the *children* it collected there are. Its slot holds their own time, and
+                # popping it would take that time out of the frame it belongs to; flushing first
+                # credits it (the pass calls the same thing a promotion, `calltree.weigh`). Found by
+                # instrumenting this loop: `covered=8980608` at the flush of the corpus's frame 0 with
+                # `sum(child_own)=0`, because the scope that held the frame's 3,108 pairs closed in the
+                # gap after it first (2026-09-30).
+                while cursor < window_count and windows[cursor].end < cycle:
+                    if active == cursor:
+                        _flush_window(windows[cursor], [covered, waiting, window_self + sum(child_own)], pairs)
+                        active = -1
+                    cursor += 1
                 if is_begin:
                     if not stack:
                         busy_begin = cycle
                     stack.append((spec_id, cycle))
+                    child_stack.append(0)
+                    child_own.append(0)
                     kind = kinds[spec_id] if spec_id is not None and spec_id < kind_count else 0
                     if kind == coverage.SPAN_WAIT:
                         if not wait_depth:
@@ -619,6 +662,14 @@ def _walk_tid(
                     ends_unpaired += 1
                     continue
                 spec, begin = stack.pop()
+                # popped in lockstep with `stack`, and before any `continue` below: a pair that is
+                # not attributed to a frame is still its parent's child while the parent is open.
+                # `is_root` is read here because the window switch rebuilds `child_stack` from the
+                # pairs still open -- which is empty for a root pair, and only for one.
+                child = child_stack.pop() if child_stack else 0
+                if child_own:
+                    child_own.pop()
+                is_root = not child_stack
                 kind = kinds[spec] if spec is not None and spec < kind_count else 0
                 if kind == coverage.SPAN_WAIT:
                     wait_depth -= 1
@@ -651,13 +702,6 @@ def _walk_tid(
                     else:
                         busy[-1] = cycle
                         coarsened += 1
-                # the window whose span holds this pair's end: the cursor only ever moves forward,
-                # because pairs are popped in end order
-                while cursor < window_count and windows[cursor].end < cycle:
-                    if active == cursor:
-                        _flush_window(windows[cursor], [covered, waiting], pairs)
-                        active = -1
-                    cursor += 1
                 if cursor >= window_count or cycle < windows[cursor].begin:
                     unframed += 1
                     continue
@@ -665,12 +709,18 @@ def _walk_tid(
                 if active != cursor:
                     active = cursor
                     covered, waiting, pairs = 0, 0, 0
+                    window_self = 0
+                    child_stack = [0] * len(stack)
+                    child_own = [0] * len(stack)
                     cover_start, cover_end = 0, -1
                     wait_start, wait_end = 0, -1
                 if begin < window.begin:
                     begin = window.begin
                     spanning += 1
                 span = cycle - begin
+                if span > 0 and not is_root:
+                    # inside its parent *in this frame*, so the parent's own time excludes it
+                    child_stack[-1] += span
                 if span > 0:
                     # the streaming union, inlined because it runs once per scope pair. The
                     # commonest shape by far is the *disjoint* one -- the next scope starts where the
@@ -709,6 +759,16 @@ def _walk_tid(
                     no_spec += 1
                     continue
                 attributed += 1
+                if span > 0 and not is_root:
+                    child_own[-1] += span - child
+                elif span > 0:
+                    # Self time, and **roots only**. Every pair's own time is already inside its
+                    # parent's own time, so summing over all of them telescopes into the roots'
+                    # *inclusive* total -- 816.21 ms against the pass's 815.38 for the corpus's frame
+                    # 52, which is how the arithmetic was caught (2026-09-30). A root's own time is
+                    # the frame's self time, and it is measured for *every* frame, not only the ones
+                    # that keep their work: one integer per frame, which is what a report ranks by.
+                    window_self += span - child
                 totals = window.totals
                 if totals is not None and span > 0:
                     totals[spec] += span
@@ -804,7 +864,7 @@ def _walk_tid(
 
     while cursor < window_count:
         if active == cursor:
-            _flush_window(windows[cursor], [covered, waiting], pairs)
+            _flush_window(windows[cursor], [covered, waiting, window_self + sum(child_own)], pairs)
             active = -1
         cursor += 1
     if occupancy_on:
@@ -1246,6 +1306,7 @@ def build_model(
 
     model = SessionModel(
         tool_version=TOOL_VERSION,
+        self_pairing={},
         session=session,
         channels=channels,
         counts=counts,

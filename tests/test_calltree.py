@@ -45,7 +45,8 @@ class TestTheFixtureTree(UeiaTestCase):
             frame=chosen, tid=2, frequency=1000000, roots=roots,
             top=calltree.top_by_self(roots, 12), total_inclusive=inclusive, total_self=own,
             pairs=pairs, ends_unpaired=counts.get("ends_unpaired", 0),
-            begins_unpaired=counts.get("begins_unpaired", 0), seconds=0.0,
+            begins_unpaired=counts.get("begins_unpaired", 0),
+            tree_source="the fixture's own tree",
             frame_self=[(next(row for row in frames if int(row["index"]) == index), count)
                         for index, count in ranked],
         )
@@ -234,6 +235,61 @@ class TestTheRealCapture(UeiaTestCase):
             for _depth, node in [(0, node) for node in tree]:
                 self.assertLessEqual(node.self, node.inclusive)
                 self.assertGreaterEqual(node.self, 0)
+
+    def test_the_walk_and_the_pass_agree_frame_by_frame(self) -> None:
+        """The same self time, measured twice and independently: in the walk, and in this pass.
+
+        One decodes every record once during the parse (`FrameRow.self_cycles`, credited to the frame
+        the pair's end falls in, with a pair still open at a window's flush promoting what it holds --
+        `model._walk_tid`); the other decodes them again here (`calltree.stream_thread`, same rule,
+        same promotion). Their agreement is the check that keeps both honest, and it is free in this
+        test: both numbers are already in hand. The two agreed to the millisecond on this capture's
+        worst three frames (815.384 / 177.750 / 164.073 ms) when the walk's accounting landed.
+        """
+        import commands
+
+        model_doc = self._model("game-pc-2")
+        view = commands.load_view(str(self.paths["game-pc-2"]))
+        stream_set = streams.assemble(view.data, view.packets)
+        counts = model.zero_counts()
+        registry = schema.build_registry(stream_set.streams[0], [], counts)
+        names = {int(row["id"]): str(row["name"]) for row in model_doc["timers"]}
+        series = [row for row in model_doc["frames"]
+                  if int(row["tid"]) == 2 and int(row["type"]) == 0][:60]
+        trees, per_frame, _pairs = calltree.stream_thread(
+            stream_set.streams[2], 2, registry, counts, [], series, names, keep=3)
+        by_index = {int(row["index"]): row for row in model_doc["frames"]}
+        self.assertTrue(per_frame, "the pass measured nothing, so there is nothing to compare")
+        for index, own in sorted(per_frame.items()):
+            measured = by_index[index].get("self_cycles")
+            self.assertIsNotNone(
+                measured, "frame %d: the walk kept no self time for it" % (index,))
+            self.assertEqual(
+                int(measured or 0), own,
+                "frame %d: the walk says %s, the pass says %d" % (index, measured, own))
+        # and what the model stores must reload as the very tree the pass built: `self` renders from
+        # the reloaded one on every run but the first, so a lossy round trip would be a wrong report
+        self.assertTrue(trees, "the pass kept no tree, so there is nothing to round-trip")
+        for index, kept in sorted(trees.items()):
+            reloaded = calltree.load_tree(calltree.pack_tree(kept), names)
+            self.assertEqual(reloaded, kept,
+                             "frame %d: the stored tree is not the tree" % (index,))
+            self.assertEqual(calltree.totals(reloaded), calltree.totals(kept))
+
+    def test_a_second_run_answers_from_the_model_and_says_the_same_thing(self) -> None:
+        """The cache may only change how long a command takes (`cache.py`): twice, byte for byte.
+
+        The first run reads the thread's streams and stores the worst frames' trees in the model; the
+        second reads none of them. Both print the same report, because the tree the report renders
+        from is the pass's own -- stored and reloaded, not recomputed differently.
+        """
+        path = str(self.paths["game-pc-2"])
+        first_code, first_out, _err = self.run_cli(["self", path])
+        second_code, second_out, _err = self.run_cli(["self", path])
+        self.assertEqual((first_code, second_code), (0, 0))
+        self.assertEqual(first_out, second_out)
+        self.assertIn("frame     : 52", first_out)
+        self.assertIn("scope pair(s)", first_out)
 
 
 if __name__ == "__main__":  # pragma: no cover - unittest discovery runs it
