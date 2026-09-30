@@ -930,3 +930,38 @@ and `advice` map file:line through whatever tree the machine has. With auto-disc
 switch absent, six transcripts (sources and advice, all three captures) differed immediately: the pins
 record the *no engine tree* behaviour, which is the deterministic half, and discovery is covered by its
 own tests (`test_engine.TestTheSearch`).
+
+## 18. What a capture carries, and what it can answer (`coverage`)
+
+The practice's first two steps as one command: *set the goal and the test system*, and know what the
+file in your hand can be asked. Every trace declares its own **channel registry** (each row with an
+`is_enabled` flag), so the file says what was recorded without decoding an event -- and an absent
+channel is **not** a zero value, it is a question the capture cannot answer (SS8). `ueia coverage`
+turns that into a verdict per analysis, names what is missing, and quotes the `-trace=` line that
+would have recorded it.
+
+**Two things stop this being a table lookup.** The registry lists every channel the *engine* knows,
+so "declared" and "recorded" are different answers; and the registry can be wrong. On the corpus,
+four channels (`bookmark`, `counters`, `log`, `stats`) carry events while their own registry rows say
+they were off -- the report prints that disagreement rather than quietly preferring one side. So
+wherever the tool models a channel, **the model's events decide**: a row claiming `cpu` is not enough
+when the schema holds no timer specs, and a capture whose registry is silent is still answerable when
+the model is full of events. For a channel nothing models yet (`memalloc`, `loadtime`, ...) the
+registry is the only word there is, and the row says so.
+
+**What it prints.** The channels recorded against the channels declared; the analyses that cannot run
+(`skipped`, never `0`), each with the channels it needed; the capture's metadata out of the trace
+itself (build, changelist, configuration, platform, project, length, threads, events); and the
+hygiene the practice asks for before anyone trusts a number -- frames and their distribution per
+thread (median, p95, longest), whether the first frame looks like a **warm-up** to trim (measured
+against that series' own median, so a capture whose frames are all slow does not read as one with a
+warm-up), and, when a second capture of the same scene is given, the run-to-run spread of the
+medians.
+
+**The re-record lines** are two, because they are two recordings: the CPU-side channels come from the
+engine's `Default` preset (`-trace=cpu,gpu,frame,log,bookmark,region,screenshot`) and allocations,
+LLM tags and callstacks come from `-trace=Memory`, which a capture has to be recorded with on purpose.
+A capture missing both gets both lines.
+
+Exit codes: 0 whenever the capture has a registry or any event at all -- "this capture cannot answer
+that" *is* the answer here -- and 2 when the file has neither, so there is nothing to report on.

@@ -28,6 +28,7 @@ import advice
 import bottleneck
 import cache
 import calltree
+import channels
 import compare
 import container
 import csvprof
@@ -703,6 +704,45 @@ def cmd_self(capture: str, args: List[str]) -> int:
         options.fmt(),
         lines,
     )
+    return 0
+
+
+def cmd_coverage(capture: str, args: List[str]) -> int:
+    """`coverage <capture> [second capture]`: what this capture carries, and what it can answer.
+
+    The practice's first two steps as one command (REFERENCE §18): the trace's own channel registry --
+    what was **recorded**, as against what the engine knows about -- the analysis each channel
+    enables, what is missing with the `-trace=` line that would have recorded it, the capture's
+    metadata, and its hygiene (frames, length, a warm-up window, and run-to-run noise when a second
+    capture of the same scene is given).
+
+    Exit 0 whenever the capture has a channel registry or any event at all: "this capture cannot
+    answer that" *is* the answer here, and printing it is the whole point. Exit 2 when the file has
+    neither -- there is nothing to report on -- and 1 on a failure.
+    """
+    second, rest = _positional(args)
+    options = parse_options(rest)
+    if options.values.keys() - {"format", "jobs"} or options.flags:
+        raise UsageError("coverage takes an optional second capture, then --format and --jobs")
+    models = []                      # the model documents, as plain mappings (`channels` reads them)
+    names: List[str] = []
+    for path in [capture] + ([second] if second else []):
+        view, model_doc, _cached = load_model(path, _jobs(options))
+        models.append(dict(model_doc))
+        names.append(view.path.name)
+    first = models[0]
+    if not first.get("channels") and not int((first.get("counts") or {}).get("events", 0)):
+        sys.stdout.write(
+            "capture   : %s\ncannot    : no channel registry and no events: there is nothing to say "
+            "about what this file can answer\n" % (names[0],))
+        return 2
+    report = channels.report_of(models, names)
+    lines = ["capture   : %s%s" % (names[0], "" if len(names) == 1 else " (against %s)"
+                                   % (", ".join(names[1:]),))]
+    prose, rows = channels.render_lines(report)
+    lines.extend(prose)
+    render_rows(("analysis", "reported by", "verdict", "missing"), rows,
+                (False, False, False, False), options.fmt(), lines)
     return 0
 
 
