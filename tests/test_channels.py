@@ -109,6 +109,19 @@ class TestTheVerdicts(UeiaTestCase):
         cpu = _state(channels.report_of([doctored], ["off"]), "cpu")
         self.assertIn("registry says it was off", cpu.note)
 
+    def test_the_gpu_channel_is_evidenced_by_either_shape(self) -> None:
+        """The current channel's queue events are GPU evidence too (REFERENCE §19)."""
+        gpu_verdict = _verdict(self.report, "GPU passes")
+        self.assertFalse(gpu_verdict.ready, "the work fixture carries no GPU data at all")
+        self.assertEqual(gpu_verdict.commands, "gpu, bottleneck")
+        doctored = dict(self.model)
+        doctored["counts"] = dict(self.model["counts"], gpu_queue_events=9)
+        doctored["gpu_frames"] = []
+        report = channels.report_of([doctored], ["queue-only"])
+        gpu_state = _state(report, "gpu")
+        self.assertEqual(gpu_state.held, 9)
+        self.assertTrue(_verdict(report, "GPU passes").ready)
+
     def test_the_report_renders_prose_and_one_row_per_analysis(self) -> None:
         prose, rows = channels.render_lines(self.report)
         self.assertEqual(len(rows), len(channels.ANALYSES))

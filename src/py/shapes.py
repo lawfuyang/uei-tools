@@ -20,8 +20,10 @@ TOOL_NAME = "ueia"
 #: and reported as a capture where no other thread ever worked. 0.5.0 added the per-frame **self
 #: time** the walk measures (`FrameRow.self_cycles`) and the call trees `ueia self` keeps for the
 #: frames it reports on (`FrameRow.self_detail`): a model without them has no frame ranking and no
-#: tree, so reading it back would send the same command to the streams again.
-TOOL_VERSION = "0.5.0"
+#: tree, so reading it back would send the same command to the streams again. 0.6.0 added the
+#: *current* GPU channel (`GpuProfiler.QueueSpec` and friends, REFERENCE §19): the per-queue
+#: timelines, the kept spans, the named passes and the fences.
+TOOL_VERSION = "0.6.0"
 CACHE_FORMAT = 1
 
 MAGIC = b"2CRT"
@@ -467,6 +469,96 @@ class GpuFrameRow(TypedDict):
     unbalanced: int
     truncated: int
     passes: List[Tuple[int, int]]
+
+
+class GpuQueueRow(TypedDict):
+    """One GPU queue of the *current* `GpuProfiler` channel (REFERENCE §19).
+
+    `GpuProfiler.QueueSpec` declares the queue (its `QueueId` packs `GPU << 8 | Type` with the
+    queue's `Index` in bits 16-23, and its `TypeString` names it -- the capture's own word, which
+    is what `name` holds); the rest is what the walk measured on its timeline. `busy_us` and
+    `wait_us` are the **unions** of the queue's work and wait intervals (outermost spans do not
+    overlap, so a union is the time the queue was executing or waiting, not a sum that double
+    counts nested spans). `submits` counts `EventBeginWork` records, `lag_negative` the ones whose
+    CPU submit timestamp sits after the GPU start (a clock-domain oddity, counted never guessed
+    away), and `lag_max_us` the largest positive submit-to-start distance seen.
+    """
+
+    id: int
+    gpu: int
+    index: int
+    type: int
+    name: str
+    boundaries: int
+    last_frame: int
+    work_spans: int
+    wait_spans: int
+    busy_us: int
+    wait_us: int
+    submits: int
+    lag_total_us: int
+    lag_negative: int
+    lag_max_us: int
+    draws: int
+    primitives: int
+
+
+class GpuSpanRow(TypedDict):
+    """One kept GPU interval of the current channel, for the placement on the CPU frame windows.
+
+    `begin_us`/`end_us` are the queue's own timestamps -- the current channel's writer is expected
+    to hand over timestamps already in the CPU clock domain (the engine's own reader converts them
+    with the session's clock: `Analysis/Engine.cpp`'s `FEventTime::AsSeconds`), so these are placed
+    with the same base and frequency as the CPU cycles, and the placement is *checked* (how many
+    land inside a frame window) rather than assumed. `kind` is `"work"` or `"wait"`.
+    """
+
+    queue: int
+    kind: str
+    begin_us: int
+    end_us: int
+
+
+class GpuPassRow(TypedDict):
+    """One named pass of the current channel: a breadcrumb spec's aggregate.
+
+    Breadcrumbs are the current channel's *names*: `EventBeginBreadcrumb`/`EventEndBreadcrumb`
+    bracket a span whose name comes from the spec's `StaticName`/`NameFormat` (joined by the
+    analysis; the spec table itself is `GpuBreadcrumbSpecRow`). `inclusive_us` is the sum of every
+    span's duration (nested breadcrumbs count in their parents too, like the CPU side), and the
+    `max_*` columns keep the biggest single span with its begin, so a report can say *when* the
+    expensive pass ran -- the evidence, not just the rank.
+    """
+
+    spec: int
+    calls: int
+    inclusive_us: int
+    max_us: int
+    max_begin_us: int
+    max_end_us: int
+
+
+class GpuBreadcrumbSpecRow(TypedDict):
+    """One `GpuProfiler.EventBreadcrumbSpec`: the id -> name map the breadcrumbs resolve through."""
+
+    spec: int
+    static_name: str
+    name_format: str
+    #: The `FieldNames` bytes (a CBOR list of the format's field names): counted, not decoded.
+    fields: int
+
+
+class GpuFenceRow(TypedDict):
+    """One fence line of the current channel, aggregated: signals and cross-queue waits.
+
+    `SignalFence` rows carry `other` = 0; `WaitFence` rows name the queue they waited on, which is
+    what makes "which queue blocked which" a sentence with a count in it.
+    """
+
+    kind: str
+    queue: int
+    other: int
+    count: int
 
 
 class BookmarkRow(TypedDict):

@@ -272,12 +272,12 @@ A capture carries only what it was recorded with (`-trace=<id>,<id>...`; the mac
 channel are `UE_TRACE_CHANNEL*` in `Runtime\TraceLog\Public\Trace\Trace.h`). This is the inventory
 of what the engine can emit — gathered from the tree on 2026-09-28, grouped by the question it
 answers, with the engine analyser to mirror for field-level truth. **An absent channel is not a
-zero value: it is a question the capture cannot answer**, and the tool says so (ROADMAP §1).
+zero value: it is a question the capture cannot answer**, and the tool says so (§18).
 
 | Channel | Carries | Answers | Engine analyser to mirror |
 |---|---|---|---|
 | `cpu` | CPU scopes on every thread (`CpuProfiler`) | which work owns the frame: the call tree, per-thread timelines, self time | `CpuProfilerTraceAnalysis.cpp` |
-| `gpu` | GPU timings, breadcrumbs, queue sync (`GpuProfiler`) | per-pass cost, GPU-bound confirmation, CPU↔GPU waits | `GpuProfilerTraceAnalysis.cpp` (and `OldGpuProfiler…` for the pre-5 format) |
+| `gpu` | GPU timings, breadcrumbs, queue sync (`GpuProfiler`) | per-pass cost, GPU-bound confirmation, CPU↔GPU waits | `GpuProfilerTraceAnalysis.cpp` (and `OldGpuProfiler…` for the pre-5 format); the current channel is §19 |
 | `frame` | frame durations per frame type | frame boundaries without `Misc.BeginFrame` | `MiscTraceAnalysis.cpp` |
 | `bookmark` | low-frequency markers (boot, level load) | ✓ used: 24 bookmarks joined in the corpus | `BookmarksTraceAnalysis.cpp` |
 | `region` | thread-agnostic timespans | "what happened inside this region" | `MiscTraceAnalysis.cpp` |
@@ -315,9 +315,10 @@ corrected this file:
 | `game-pc-2` (game) | the same CPU channels, `Memory.MemoryScope` (38,595), CSV/stat *definitions* | everything GPU (no `GpuProfiler` at all), `task`, allocations, `loadtime` |
 | `viewer-pc-3` | `cpu` scopes, counters, log | **any frame pair**, GPU, `task` |
 
-So the GPU and memory items do not start from nothing after all; what is still missing for a full
-GPU answer is the *current* channel's queue semantics (waits, fences, breadcrumbs — §11 decodes the
-legacy per-frame form), and for memory an allocations channel rather than a tag scope.
+So the GPU and memory items do not start from nothing after all; what was still missing for a full
+GPU answer — the *current* channel's queue semantics (waits, fences, breadcrumbs; §11 decodes the
+legacy per-frame form) — is decoded now (§19), and for memory an allocations channel rather than a
+tag scope.
 
 ## 9. Engine programs that read traces (what we wrap, and what we do not)
 
@@ -423,10 +424,10 @@ it** in cycles, and the busiest of them is the one a verdict names. Thread roles
 **heuristic** again, and each report line says so.
 
 **3. The GPU.** The corpus carries the **legacy** `GpuProfiler` channel (one event per rendered
-frame), not the current one (one event per GPU work item): the writer was removed in UE 5.6, and UE
-5.8.3 ships only the reader (`OldGpuProfilerTraceAnalysis.cpp`, "maintained for backward
-compatibility with old traces"). That reader is the layout's authority, and `gpu.py` follows it field
-for field:
+frame), not the current one (one event per GPU work item — that decode is §19, and it is the second
+way this verdict reaches a GPU answer): the legacy writer was removed in UE 5.6, and UE 5.8.3 ships
+only the reader (`OldGpuProfilerTraceAnalysis.cpp`, "maintained for backward compatibility with old
+traces"). That reader is the layout's authority, and `gpu.py` follows it field for field:
 
 | Event | Fields | Meaning |
 |---|---|---|
@@ -965,3 +966,69 @@ A capture missing both gets both lines.
 
 Exit codes: 0 whenever the capture has a registry or any event at all -- "this capture cannot answer
 that" *is* the answer here -- and 2 when the file has neither, so there is nothing to report on.
+
+## 19. The current GPU channel: queue timelines, passes, and the `gpu` report
+
+The engine has **two** GPU channel shapes on one `gpu` channel id. The corpus carries the *legacy*
+one (§11: a whole rendered frame packed into one `GpuProfiler.Frame` event). UE 5.6 removed that
+writer and replaced it with the **current** one — `Runtime\RHI\Private\GpuProfilerTrace.cpp` writes
+one trace event per GPU work item, and `TraceServices\Private\Analyzers\GpuProfilerTraceAnalysis.cpp`
+(the reader this module mirrors rule for rule) consumes them. What the current channel declares:
+
+| Event | Fields | Notes |
+|---|---|---|
+| `GpuProfiler.Init` (Important) | `uint8 Version` | 2 in this checkout; read into the session |
+| `GpuProfiler.QueueSpec` (Important) | `uint32 QueueId`, `WideString TypeString` | `GPU = id>>8`, `Index = id>>16` (both `& 0xFF`), `Type = id & 0xFF` |
+| `GpuProfiler.EventFrameBoundary` | `uint32 QueueId`, `uint32 FrameNumber` | the queue's own rendered-frame numbers |
+| `GpuProfiler.EventBeginWork` / `EventEndWork` | `QueueId`, `uint64 GPUTimestampTOP` / `GPUTimestampBOP`; the begin adds `uint64 CPUTimestamp` | the work brackets; the CPU timestamp is the submission |
+| `GpuProfiler.EventWait` | `QueueId`, `uint64 StartTime`, `uint64 EndTime` | a self-contained span: the queue idle waiting for a fence |
+| `GpuProfiler.EventBreadcrumbSpec` (Important) | `uint32 SpecId`, `WideString StaticName`, `WideString NameFormat`, `uint8[] FieldNames` | the id → name map; `FieldNames` is a CBOR blob, counted not decoded |
+| `GpuProfiler.EventBeginBreadcrumb` / `EventEndBreadcrumb` | `SpecId`, `QueueId`, `uint64 GPUTimestampTOP` / `GPUTimestampBOP`; the begin adds `uint8[] Metadata` (CBOR) | the *named* spans — the current channel's "passes" |
+| `GpuProfiler.EventStats` | `QueueId`, `uint32 NumDraws`, `uint32 NumPrimitives` | accumulated between frame boundaries |
+| `GpuProfiler.SignalFence` / `WaitFence` | `QueueId`, `uint64 CPUTimestamp`, `uint64 Value`; the wait adds `uint32 QueueToWaitForId` | who signalled, and which queue waited on whom |
+
+The wire rules the reader pins, and ours follow:
+
+* **One clock.** The platform RHI translates GPU timestamps into the CPU clock domain before the
+  profiler sees them (the calibration the legacy channel carried is gone — the header says so), and
+  the engine reader converts them with the *session's* clock (`Analysis\Engine.cpp`'s
+  `FEventTime::AsSeconds(ts)`, the same conversion CPU cycles get). We place the spans with the
+  session's own base and frequency — and then **check** the placement: fewer than half the work
+  spans landing inside a frame window, or a timeline that overlaps none, is refused, and the
+  per-frame numbers read as unknown while the queue totals stand.
+* **Two stacks per queue.** Breadcrumbs and work bracket independently (the reader keeps a stack
+  per kind), so a breadcrumb can nest inside a work span without disturbing either pairing.
+* **A timestamp of 0 is "could not be determined"** and the reader skips the event; we skip it and
+  count it (`gpu_zero_timestamps`). Interleaved/reversed timestamps, negative durations, unpaired
+  brackets and breadcrumb begins with no spec are warnings on the reader's console — here they are
+  counters a report can quote (`gpu_out_of_order`, `gpu_negative_durations`, `gpu_work_unpaired`,
+  `gpu_breadcrumb_no_spec`), because a count survives where a console does not.
+* **`busy_us` and `wait_us` are unions** of each queue's intervals — outermost work spans do not
+  overlap, so their union is the time the queue was executing traced work, and a nested span is
+  counted once. The kept intervals are capped per queue and kind (`gpu.QUEUE_SPAN_KEEP`); past the
+  cap the tail folds into the last interval — the union is then *overstated* where it happened,
+  which `gpu_spans_coarsened` counts. Named passes are capped by inclusive time
+  (`gpu.QUEUE_PASS_KEEP`), the fold counted in `gpu_passes_dropped`.
+* **Wide strings on the importants stream are UTF-16.** `QueueSpec.TypeString` and the breadcrumb
+  spec's names are declared `WideString`, and the engine's important writer `memcpy`s the UTF-16
+  (`ImportantLogScope.inl`'s `FFieldSet<…, WideString>`) — where a field is declared `AnsiString`
+  and fed wide literals (the CPU profiler's spec names), the same writer truncates each character
+  to its low byte. Decoding by the *declared* type (2026-09-30) is what unmangled
+  `Diagnostics.Session2`'s build version and `Misc.BookmarkSpec`'s format string on real captures.
+
+**What `ueia gpu` reports** (`--table queues|passes|frames`): per queue — name, busy/wait unions,
+submit-to-start lag (mean, max, and the count of submits whose CPU timestamp lands *after* the GPU
+start: counted, never reinterpreted), draw counts and frame boundaries; per pass — calls, inclusive
+time, the biggest single span and the second it ran; per frame — the GPU busy and wait time inside
+each window of the judged series, worst first, the same number `bottleneck` spends. The fences name
+the cross-queue blocking (`queue 2 waited on queue 0, 3 time(s)`). A capture carrying the legacy
+channel instead gets its state named and a pointer to `bottleneck`, which judges frames; a capture
+carrying neither exits 2 with the `-trace=` line. Breadcrumbs are conditionally compiled into the
+engine (`WITH_RHI_BREADCRUMBS`), so work without a single named pass is its own sentence, not an
+error.
+
+On this machine's corpus the current channel is absent from all three captures (the editor session
+carries the legacy one; the other two carry no GPU data at all), so the transcripts pin the absent
+halves — the queue decode itself is pinned by the hermetic fixtures, hand-computed microsecond by
+microsecond (`test_gpu`, `test_queues`), and a capture recorded with a 5.6+ engine is what the
+queue half still wants against the real world.

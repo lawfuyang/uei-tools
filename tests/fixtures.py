@@ -600,3 +600,203 @@ def timed_scope(uid: int, stamp: int) -> bytes:
     is the uid byte first and the timestamp's low seven bytes after it.
     """
     return struct.pack("<Q", (stamp << 8) | (uid << 1))
+
+
+# The *current* GpuProfiler channel (REFERENCE §19): one event per GPU work item. The uids here
+# are fixture-local (the capture's own schema maps uid -> event, so nothing on the tool side cares
+# which numbers they get); the field shapes are the engine's own (`RHI/Private/GpuProfilerTrace.cpp`).
+
+#: First uid used for the channel's events; the fixtures take the next twelve.
+GPU_QUEUE_UID_BASE = 40
+
+_GPU_QUEUE_EVENT_FIELDS: Tuple[Tuple[str, Tuple[Tuple[str, str], ...], int], ...] = (
+    # (name, fields, flags): important spec records come in one flavour, stream events another
+    ("Init", (("Version", "u8"),), EVENT_FLAG_IMPORTANT | EVENT_FLAG_NOSYNC),
+    ("QueueSpec", (("QueueId", "u32"), ("TypeString", "ws")),
+     EVENT_FLAG_IMPORTANT | EVENT_FLAG_NOSYNC),
+    ("EventFrameBoundary", (("QueueId", "u32"), ("FrameNumber", "u32")), 0),
+    ("EventBreadcrumbSpec", (("SpecId", "u32"), ("StaticName", "ws"), ("NameFormat", "ws"),
+                             ("FieldNames", "arr")), EVENT_FLAG_IMPORTANT | EVENT_FLAG_NOSYNC),
+    ("EventBeginBreadcrumb", (("SpecId", "u32"), ("QueueId", "u32"), ("GPUTimestampTOP", "u64"),
+                              ("Metadata", "arr")), EVENT_FLAG_MAYBE_HAS_AUX),
+    ("EventEndBreadcrumb", (("QueueId", "u32"), ("GPUTimestampBOP", "u64")), 0),
+    ("EventBeginWork", (("QueueId", "u32"), ("GPUTimestampTOP", "u64"), ("CPUTimestamp", "u64")), 0),
+    ("EventEndWork", (("QueueId", "u32"), ("GPUTimestampBOP", "u64")), 0),
+    ("EventWait", (("QueueId", "u32"), ("StartTime", "u64"), ("EndTime", "u64")), 0),
+    ("EventStats", (("QueueId", "u32"), ("NumDraws", "u32"), ("NumPrimitives", "u32")), 0),
+    ("SignalFence", (("QueueId", "u32"), ("CPUTimestamp", "u64"), ("Value", "u64")), 0),
+    ("WaitFence", (("QueueId", "u32"), ("CPUTimestamp", "u64"), ("QueueToWaitForId", "u32"),
+                   ("Value", "u64")), 0),
+)
+
+
+def gpu_queue_uid(name: str) -> int:
+    """The fixture uid of one current-channel event, by its engine name."""
+    for index, (event_name, _fields, _flags) in enumerate(_GPU_QUEUE_EVENT_FIELDS):
+        if event_name == name:
+            return GPU_QUEUE_UID_BASE + index
+    raise AssertionError("no such GpuProfiler event in the fixture: %s" % (name,))
+
+
+def gpu_channel_schema() -> bytes:
+    """The current channel's twelve events, declared exactly as the engine declares them."""
+    out = b""
+    for index, (name, fields, flags) in enumerate(_GPU_QUEUE_EVENT_FIELDS):
+        out += new_event_record(
+            GPU_QUEUE_UID_BASE + index, "GpuProfiler", name, fields, flags=flags,
+        )
+    return out
+
+
+def _ws(value: str) -> bytes:
+    """A wide string's aux bytes, as the important writer's WideString field writes it."""
+    return value.encode("utf-16-le")
+
+
+def gpu_queue_importants() -> bytes:
+    """The session, the thread names, and the current channel's declarations `gpu_queue_trace` uses.
+
+    The session starts at cycle 1,000,000 with a 1,000,000 Hz frequency, so one cycle is one
+    microsecond and every number in the streams is a hand-checkable microsecond of session time.
+    """
+    return (
+        important_record(16, pack("u64", 1000000) + pack("u64", 1000000))
+        + important_record(17, pack("u32", 2) + important_aux_block(1, b"GameThread"))
+        + important_record(17, pack("u32", 6) + important_aux_block(1, b"RHIThread"))
+        # queue 0 is the graphics queue ("Direct"), queue 2 the copy queue -- the ids the engine's
+        # QueueId packing produces (GPU << 8 | Type, index in bits 16-23)
+        + important_record(gpu_queue_uid("QueueSpec"),
+                           pack("u32", 0) + important_aux_block(1, _ws("Direct")))
+        + important_record(gpu_queue_uid("QueueSpec"),
+                           pack("u32", 2) + important_aux_block(1, _ws("Copy")))
+        + important_record(gpu_queue_uid("EventBreadcrumbSpec"),
+                           pack("u32", 1) + important_aux_block(1, _ws("ShadowPass"))
+                           + important_aux_block(2, _ws("ShadowPass"))
+                           + important_aux_block(3, b"\x00"))
+        + important_record(gpu_queue_uid("EventBreadcrumbSpec"),
+                           pack("u32", 2) + important_aux_block(1, _ws("BasePass"))
+                           + important_aux_block(2, _ws("BasePass"))
+                           + important_aux_block(3, b"\x00"))
+        + important_record(gpu_queue_uid("Init"), pack("u8", 2))
+    )
+
+
+def _queue_event(name: str, payload: bytes, serial: int, aux: Sequence[Tuple[int, bytes]] = ()) -> bytes:
+    """One current-channel event on a thread stream: a sync event with a serial, like the real ones."""
+    return event(gpu_queue_uid(name), payload, serial=serial, aux=aux)
+
+
+def gpu_queue_stream() -> bytes:
+    """One GPU thread's queue events, every number hand-checkable (all values are microseconds).
+
+    The stream order is the timestamp order, which is what the writer's process-queue thread
+    produces. Queue 0 (Direct): a nested 8 ms work span (1,002,000-1,010,000, with a begin at
+    1,003,000 inside it), a 2 ms wait, two breadcrumbs (ShadowPass 7 ms from 1,002,000, BasePass
+    3 ms nested inside it), draw stats, three frame boundaries, one submit with a zero timestamp
+    (counted, skipped), one end with no begin and one begin that never closes (both counted), one
+    negative wait (counted). Queue 2 (Copy): a 0.5 ms work span, and a fence wait on queue 0.
+    """
+    out = _queue_event("EventFrameBoundary", pack("u32", 0) + pack("u32", 1), 1)
+    out += _queue_event("EventBeginWork",
+                        pack("u32", 0) + pack("u64", 1002000) + pack("u64", 1001000), 2)
+    out += _queue_event("EventBeginBreadcrumb",
+                        pack("u32", 1) + pack("u32", 0) + pack("u64", 1002000),
+                        3, aux=[(3, b"")])
+    out += _queue_event("EventBeginWork",
+                        pack("u32", 0) + pack("u64", 1003000) + pack("u64", 1002500), 4)
+    out += _queue_event("EventBeginBreadcrumb",
+                        pack("u32", 2) + pack("u32", 0) + pack("u64", 1003000),
+                        5, aux=[(3, b"")])
+    out += _queue_event("EventEndBreadcrumb", pack("u32", 0) + pack("u64", 1006000), 6)
+    out += _queue_event("EventEndBreadcrumb", pack("u32", 0) + pack("u64", 1009000), 7)
+    out += _queue_event("EventEndWork", pack("u32", 0) + pack("u64", 1010000), 8)
+    out += _queue_event("EventEndWork", pack("u32", 0) + pack("u64", 1010000), 9)
+    out += _queue_event("EventWait", pack("u32", 0) + pack("u64", 1010000) + pack("u64", 1012000), 10)
+    out += _queue_event("EventStats", pack("u32", 0) + pack("u32", 120) + pack("u32", 2400), 11)
+    out += _queue_event("EventFrameBoundary", pack("u32", 0) + pack("u32", 2), 12)
+    out += _queue_event("SignalFence", pack("u32", 0) + pack("u64", 1012000) + pack("u64", 7), 13)
+    out += _queue_event("EventBeginWork",
+                        pack("u32", 2) + pack("u64", 1011000) + pack("u64", 1010900), 14)
+    out += _queue_event("EventEndWork", pack("u32", 2) + pack("u64", 1011500), 15)
+    out += _queue_event("WaitFence",
+                        pack("u32", 2) + pack("u64", 1012500) + pack("u32", 0) + pack("u64", 7), 16)
+    out += _queue_event("EventBeginWork",
+                        pack("u32", 0) + pack("u64", 1020000) + pack("u64", 1019000), 17)
+    out += _queue_event("EventEndWork", pack("u32", 0) + pack("u64", 1026000), 18)
+    out += _queue_event("EventBeginWork",
+                        pack("u32", 0) + pack("u64", 0) + pack("u64", 5), 19)
+    out += _queue_event("EventEndWork", pack("u32", 0) + pack("u64", 1030000), 20)
+    out += _queue_event("EventWait", pack("u32", 0) + pack("u64", 1033000) + pack("u64", 1032000), 21)
+    out += _queue_event("EventFrameBoundary", pack("u32", 0) + pack("u32", 3), 22)
+    out += _queue_event("EventBeginWork",
+                        pack("u32", 0) + pack("u64", 1034000) + pack("u64", 1033500), 23)
+    return out
+
+
+def gpu_queue_cpu_stream() -> bytes:
+    """Three CPU frames the queue events sit beside: 16, 16 and 4 ms."""
+    frames = ((1000000, 1016000), (1016000, 1032000), (1032000, 1036000))
+    out = b""
+    for index, (begin, end) in enumerate(frames, start=1):
+        out += event(22, pack("u64", begin) + pack("u8", 0), serial=index * 2)
+        out += event(23, pack("u64", end) + pack("u8", 0), serial=index * 2 + 1)
+    return out
+
+
+def gpu_queue_trace() -> bytes:
+    """A capture carrying the *current* GPU channel: the fixture `test_queues` is pinned against."""
+    schema = (
+        new_event_record(16, "$Trace", "NewTrace",
+                         [("StartCycle", "u64"), ("CycleFrequency", "u64")],
+                         flags=EVENT_FLAG_NOSYNC)
+        + new_event_record(17, "$Trace", "ThreadInfo", [("ThreadId", "u32"), ("Name", "s")],
+                           flags=EVENT_FLAG_IMPORTANT | EVENT_FLAG_MAYBE_HAS_AUX
+                           | EVENT_FLAG_NOSYNC)
+        + new_event_record(22, "Misc", "BeginFrame", [("Cycle", "u64"), ("FrameType", "u8")])
+        + new_event_record(23, "Misc", "EndFrame", [("Cycle", "u64"), ("FrameType", "u8")])
+        + gpu_channel_schema()
+    )
+    return build_trace(
+        events_stream=schema, importants_stream=gpu_queue_importants(),
+        threads={2: gpu_queue_cpu_stream(), 6: gpu_queue_stream()},
+    )
+
+
+def gpu_bound_stream() -> bytes:
+    """One 33.3 ms frame whose thread is inside `WaitForTasks` the whole time (fixture B's CPU)."""
+    records = (
+        (1000000, 9, True),
+        (1033334, None, False),
+    )
+    return (
+        event(22, pack("u64", 1000000) + pack("u8", 0), serial=1)
+        + parallel_records(records)
+        + event(23, pack("u64", 1033334) + pack("u8", 0), serial=2)
+        + event(22, pack("u64", 1033334) + pack("u8", 0), serial=3)
+        + event(23, pack("u64", 1045000) + pack("u8", 0), serial=4)
+    )
+
+
+def gpu_bound_gpu_stream() -> bytes:
+    """The same frame's GPU work: one 32.295 ms span on the graphics queue, submitted early."""
+    return (
+        _queue_event("EventFrameBoundary", pack("u32", 0) + pack("u32", 1), 1)
+        + _queue_event("EventBeginWork",
+                       pack("u32", 0) + pack("u64", 1000005) + pack("u64", 999500), 2)
+        + _queue_event("EventEndWork", pack("u32", 0) + pack("u64", 1033300), 3)
+    )
+
+
+def gpu_bound_trace() -> bytes:
+    """A capture whose only GPU data is the *current* channel: `bottleneck` must still reach its
+    GPU verdict from the queue timeline (the queue spans land inside the frame window), and `gpu`
+    must report the queues without a legacy frame in sight."""
+    return build_trace(
+        events_stream=work_schema() + gpu_channel_schema(),
+        importants_stream=work_importants() + (
+            important_record(17, pack("u32", 6) + important_aux_block(1, b"RHIThread"))
+            + important_record(gpu_queue_uid("QueueSpec"),
+                               pack("u32", 0) + important_aux_block(1, _ws("Direct")))
+        ),
+        threads={2: gpu_bound_stream(), 6: gpu_bound_gpu_stream()},
+    )

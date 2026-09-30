@@ -77,12 +77,23 @@ class TestEventValues(UeiaTestCase):
         values = decode.event_values(row, stream, event)
         self.assertEqual(values["Name"], "wide")
 
-    def test_wide_as_bytes_reads_the_important_writers_one_byte_per_char(self) -> None:
-        row = _row_for([("Name", "ws")])
-        event = RawEvent(uid=42, serial=None, offset=0, size=0, aux=[(0, 0, 4)], b_scope=False)
-        self.assertNotEqual(decode.event_values(row, b"wide", event)["Name"], "wide")
-        values = decode.event_values(row, b"wide", event, wide_as_bytes=True)
-        self.assertEqual(values["Name"], "wide")
+    def test_a_string_decodes_by_its_declared_type_not_its_contents(self) -> None:
+        """A declared WideString is UTF-16 even when the bytes look like text, and vice versa.
+
+        The engine's important writer memcpy's UTF-16 for a field declared `WideString`
+        (`FFieldSet<…, WideString>::Impl`) and truncates to the low byte for one declared
+        `AnsiString` fed wide literals -- the decode follows the declaration, which is what
+        `Diagnostics.Session2`'s build version and `Misc.BookmarkSpec`'s format string (both
+        genuinely wide, both mangled before 2026-09-30) need.
+        """
+        wide_row = _row_for([("Name", "ws")])
+        event = RawEvent(uid=42, serial=None, offset=0, size=0, aux=[(0, 0, 8)], b_scope=False)
+        utf16 = "wide".encode("utf-16-le")
+        self.assertEqual(decode.event_values(wide_row, utf16, event)["Name"], "wide")
+        narrow_row = _row_for([("Name", "s")])
+        self.assertEqual(decode.event_values(narrow_row, utf16, event)["Name"],
+                         "w\x00i\x00d\x00e",
+                         "narrow bytes are not reinterpreted as UTF-16: the low bytes are the text")
 
     def test_missing_aux_leaves_the_field_absent(self) -> None:
         row = _row_for([("Name", "s")])

@@ -52,7 +52,7 @@ ANALYSES: Tuple[Analysis, ...] = (
              "threads, parallelism, coverage", ("cpu",)),
     Analysis("the task graph and its critical path", "tasks", ("task",)),
     Analysis("GPU passes, queue synchronisation, and a GPU-bound verdict",
-             "bottleneck", ("gpu",)),
+             "gpu, bottleneck", ("gpu",)),
     Analysis("bookmarks: boot, level loads, markers in time", "summary, advice", ("bookmark",)),
     Analysis("regions: thread-agnostic timespans", "summary", ("region",)),
     Analysis("log messages and their specs", "summary", ("log",)),
@@ -137,6 +137,12 @@ def _held(model: Dict[str, Any], channel: str) -> Optional[Tuple[int, str]]:
     """`(how many, of what)` the model holds for a channel, or None when we do not model it."""
     if channel == "log":
         return int(_counts(model).get("log_messages", 0)), "log message(s)"
+    if channel == "gpu":
+        # either channel shape is evidence: the legacy per-frame rows, or the current channel's
+        # queue events (REFERENCE §19). A modern capture can carry only the latter.
+        frames = len(model.get("gpu_frames") or [])
+        events = int(_counts(model).get("gpu_queue_events", 0))
+        return frames + events, "GPU frame(s)/queue event(s)"
     entry = EVIDENCE.get(channel)
     if entry is None:
         return None

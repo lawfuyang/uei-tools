@@ -1,15 +1,17 @@
-"""The legacy GpuProfiler decoder: the batch codec, the specs, and what it does with rubbish.
+"""The GpuProfiler decoders: the legacy batch codec, the specs, and the current channel's queues.
 
 Every batch below is built by hand, with the timestamps spelled out, so the expected busy times,
-depths and pass lists are arithmetic rather than whatever the code happens to return. The layout is
-the engine's own backward-compatibility decoder's (`OldGpuProfilerTraceAnalysis.cpp:143-204`):
-varint deltas, a begin carrying a uint32 spec id, an end carrying nothing.
+depths and pass lists are arithmetic rather than whatever the code happens to return. The legacy
+layout is the engine's own backward-compatibility decoder's (`OldGpuProfilerTraceAnalysis.cpp:
+143-204`): varint deltas, a begin carrying a uint32 spec id, an end carrying nothing. The current
+channel's shapes are `RHI/Private/GpuProfilerTrace.cpp`'s, and the state machine mirrors the
+engine reader's two stacks per queue (`GpuProfilerTraceAnalysis.cpp`).
 """
 
 from __future__ import annotations
 
 import unittest
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import gpu
 from shapes import GpuFrameRow, GpuSpecRow
@@ -185,6 +187,270 @@ class TestTheClock(unittest.TestCase):
         self.assertAlmostEqual(gpu.wall_seconds(1000000, 1000000, 1.0, 5.0), 5.0)
         self.assertAlmostEqual(gpu.wall_seconds(3000000, 1000000, 1.0, 5.0), 7.0)
         self.assertAlmostEqual(gpu.wall_seconds(3000000, 1000000, 0.5, 5.0), 6.0)
+
+
+def counts() -> Dict[str, int]:
+    """A fresh walk-counter dict, the keys the queue decode writes included."""
+    from model import zero_counts
+
+    return zero_counts()
+
+
+class TestTheQueueIds(unittest.TestCase):
+    """`QueueId` unpacks into the GPU, the per-GPU index and the queue type."""
+
+    def test_the_engine_reader_s_unpacking(self) -> None:
+        # GPU 1, index 2, type 3 -- the bytes the reader reads out of `(id >> 8)`, `(id >> 16)`, `id`
+        self.assertEqual(gpu.queue_id_parts(0x020103), (1, 2, 3))
+
+    def test_the_zero_queue_is_gpu_zero_direct(self) -> None:
+        self.assertEqual(gpu.queue_id_parts(0), (0, 0, 0))
+
+
+class TestTheQueueSpecs(unittest.TestCase):
+    """`queue_spec` and `breadcrumb_spec`: the id -> name maps the current channel resolves through."""
+
+    def test_a_queue_spec_carries_its_name_and_its_id_parts(self) -> None:
+        row = gpu.queue_spec({"QueueId": 2, "TypeString": "Copy"})
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual((row["id"], row["gpu"], row["index"], row["type"], row["name"]),
+                         (2, 0, 0, 2, "Copy"))
+
+    def test_a_queue_spec_without_an_id_is_refused(self) -> None:
+        self.assertIsNone(gpu.queue_spec({"TypeString": "Direct"}))
+
+    def test_a_breadcrumb_spec_keeps_both_names_and_the_field_blob_s_size(self) -> None:
+        row = gpu.breadcrumb_spec({"SpecId": 7, "StaticName": "Pass", "NameFormat": "Pass %s",
+                                   "FieldNames": b"\x00\x01"})
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["spec"], 7)
+        self.assertEqual(row["fields"], 2)
+
+    def test_a_breadcrumb_spec_without_an_id_is_refused(self) -> None:
+        self.assertIsNone(gpu.breadcrumb_spec({"StaticName": "Pass"}))
+
+    def test_breadcrumb_name_prefers_the_format_and_falls_back(self) -> None:
+        specs = {1: {"spec": 1, "static_name": "Pass", "name_format": "Pass %s", "fields": 0}}
+        self.assertEqual(gpu.breadcrumb_name(1, specs), "Pass %s")
+        bare = {2: {"spec": 2, "static_name": "Pass", "name_format": "", "fields": 0}}
+        self.assertEqual(gpu.breadcrumb_name(2, bare), "Pass")
+        self.assertEqual(gpu.breadcrumb_name(3, bare), "spec 3")
+
+
+class TestTheQueueWalk(unittest.TestCase):
+    """`QueueWalk`: begin/end pairing, waits, breadcrumbs, and every refusal counted."""
+
+    def _walk(self) -> gpu.QueueWalk:
+        return gpu.QueueWalk(counts())
+
+    def _flush_queues(self, walk: gpu.QueueWalk) -> Dict[int, Tuple[int, int]]:
+        queues, _spans, _passes, _fences = walk.flush()
+        return {int(row["id"]): (int(row["busy_us"]), int(row["wait_us"])) for row in queues}
+
+    def _work(self, walk: gpu.QueueWalk, queue: int, top: int, cpu: int = 0) -> None:
+        walk.event(gpu.BEGIN_WORK_EVENT, {"QueueId": queue, "GPUTimestampTOP": top,
+                                          "CPUTimestamp": cpu})
+
+    def _end(self, walk: gpu.QueueWalk, queue: int, bop: int) -> None:
+        walk.event(gpu.END_WORK_EVENT, {"QueueId": queue, "GPUTimestampBOP": bop})
+
+    def test_a_work_pair_is_its_own_busy_time(self) -> None:
+        walk = self._walk()
+        self._work(walk, 0, 1000, 900)
+        self._end(walk, 0, 2000)
+        self.assertEqual(self._flush_queues(walk)[0], (1000, 0))
+
+    def test_a_nested_span_counts_once_in_the_union(self) -> None:
+        walk = self._walk()
+        self._work(walk, 0, 1000)
+        self._work(walk, 0, 1500)
+        self._end(walk, 0, 2500)
+        self._end(walk, 0, 3000)
+        self.assertEqual(self._flush_queues(walk)[0], (2000, 0), "the union, not the 2500 us sum")
+
+    def test_two_queues_are_independent(self) -> None:
+        walk = self._walk()
+        self._work(walk, 0, 1000)
+        self._end(walk, 0, 2000)
+        self._work(walk, 2, 1500)
+        self._end(walk, 2, 2000)
+        totals = self._flush_queues(walk)
+        self.assertEqual(totals[0], (1000, 0))
+        self.assertEqual(totals[2], (500, 0))
+
+    def test_a_wait_is_its_own_interval(self) -> None:
+        walk = self._walk()
+        walk.event(gpu.WAIT_EVENT, {"QueueId": 0, "StartTime": 1000, "EndTime": 4000})
+        self.assertEqual(self._flush_queues(walk)[0], (0, 3000))
+
+    def test_a_backwards_wait_is_counted_and_dropped(self) -> None:
+        walk = self._walk()
+        walk.event(gpu.WAIT_EVENT, {"QueueId": 0, "StartTime": 4000, "EndTime": 1000})
+        queues, _spans, _passes, _fences = walk.flush()
+        self.assertEqual(int(queues[0]["wait_us"]), 0)
+        self.assertEqual(walk.counts["gpu_negative_durations"], 1)
+
+    def test_an_end_with_no_begin_is_counted(self) -> None:
+        walk = self._walk()
+        self._end(walk, 0, 2000)
+        self.assertEqual(self._flush_queues(walk)[0], (0, 0))
+        self.assertEqual(walk.counts["gpu_work_unpaired"], 1)
+
+    def test_a_begin_left_open_is_counted_at_flush(self) -> None:
+        walk = self._walk()
+        self._work(walk, 0, 1000)
+        self.assertEqual(self._flush_queues(walk)[0], (0, 0))
+        self.assertEqual(walk.counts["gpu_work_unpaired"], 1)
+
+    def test_a_zero_timestamp_is_skipped_the_way_the_engine_skips_it(self) -> None:
+        walk = self._walk()
+        self._work(walk, 0, 0, 900)
+        self._end(walk, 0, 2000)
+        self.assertEqual(walk.counts["gpu_zero_timestamps"], 1)
+        self.assertEqual(walk.counts["gpu_work_unpaired"], 1, "the end now has no begin")
+
+    def test_a_zero_cpu_submit_timestamp_measures_no_lag(self) -> None:
+        walk = self._walk()
+        self._work(walk, 0, 2000, 0)
+        self._end(walk, 0, 3000)
+        queues, _spans, _passes, _fences = walk.flush()
+        self.assertEqual(int(queues[0]["submits"]), 1)
+        self.assertEqual(int(queues[0]["lag_total_us"]), 0, "0 is not determined, not zero lag")
+
+    def test_a_negative_duration_is_counted_and_dropped(self) -> None:
+        walk = self._walk()
+        self._work(walk, 0, 2000)
+        self._end(walk, 0, 1000)
+        self.assertEqual(self._flush_queues(walk)[0], (0, 0))
+        self.assertEqual(walk.counts["gpu_negative_durations"], 1)
+
+    def test_a_backwards_begin_is_out_of_order(self) -> None:
+        walk = self._walk()
+        self._work(walk, 0, 2000)
+        self._end(walk, 0, 3000)
+        self._work(walk, 0, 1000)
+        self.assertEqual(walk.counts["gpu_out_of_order"], 1)
+
+    def test_the_lag_aggregates_over_the_submits(self) -> None:
+        walk = self._walk()
+        self._work(walk, 0, 2000, 1500)
+        self._end(walk, 0, 3000)
+        self._work(walk, 0, 5000, 5600)   # the CPU timestamp after the GPU start: negative
+        self._end(walk, 0, 6000)
+        queues, _spans, _passes, _fences = walk.flush()
+        self.assertEqual(int(queues[0]["submits"]), 2)
+        self.assertEqual(int(queues[0]["lag_total_us"]), 500)
+        self.assertEqual(int(queues[0]["lag_max_us"]), 500)
+        self.assertEqual(int(queues[0]["lag_negative"]), 1)
+
+    def test_stats_and_boundaries_accumulate_on_the_row(self) -> None:
+        walk = self._walk()
+        walk.event(gpu.STATS_EVENT, {"QueueId": 0, "NumDraws": 10, "NumPrimitives": 100})
+        walk.event(gpu.STATS_EVENT, {"QueueId": 0, "NumDraws": 5, "NumPrimitives": 50})
+        walk.event(gpu.FRAME_BOUNDARY_EVENT, {"QueueId": 0, "FrameNumber": 4})
+        queues, _spans, _passes, _fences = walk.flush()
+        self.assertEqual(int(queues[0]["draws"]), 15)
+        self.assertEqual(int(queues[0]["primitives"]), 150)
+        self.assertEqual(int(queues[0]["boundaries"]), 1)
+        self.assertEqual(int(queues[0]["last_frame"]), 4)
+
+    def test_breadcrumbs_aggregate_per_spec(self) -> None:
+        walk = self._walk()
+        walk.event(gpu.BEGIN_BREADCRUMB_EVENT,
+                   {"SpecId": 1, "QueueId": 0, "GPUTimestampTOP": 1000, "Metadata": b""})
+        walk.event(gpu.END_BREADCRUMB_EVENT, {"QueueId": 0, "GPUTimestampBOP": 4000})
+        walk.event(gpu.BEGIN_BREADCRUMB_EVENT,
+                   {"SpecId": 1, "QueueId": 0, "GPUTimestampTOP": 5000, "Metadata": b""})
+        walk.event(gpu.END_BREADCRUMB_EVENT, {"QueueId": 0, "GPUTimestampBOP": 7000})
+        _queues, _spans, passes, _fences = walk.flush()
+        self.assertEqual(len(passes), 1)
+        self.assertEqual(int(passes[0]["calls"]), 2)
+        self.assertEqual(int(passes[0]["inclusive_us"]), 5000)
+        self.assertEqual(int(passes[0]["max_us"]), 3000)
+        self.assertEqual(int(passes[0]["max_begin_us"]), 1000)
+
+    def test_a_breadcrumb_end_with_no_begin_is_counted(self) -> None:
+        walk = self._walk()
+        walk.event(gpu.END_BREADCRUMB_EVENT, {"QueueId": 0, "GPUTimestampBOP": 4000})
+        self.assertEqual(walk.counts["gpu_work_unpaired"], 1)
+
+    def test_a_breadcrumb_without_a_spec_id_is_counted_and_still_aggregated(self) -> None:
+        walk = self._walk()
+        walk.event(gpu.BEGIN_BREADCRUMB_EVENT,
+                   {"QueueId": 0, "GPUTimestampTOP": 1000, "Metadata": b""})
+        walk.event(gpu.END_BREADCRUMB_EVENT, {"QueueId": 0, "GPUTimestampBOP": 2000})
+        self.assertEqual(walk.counts["gpu_breadcrumb_no_spec"], 1)
+        _queues, _spans, passes, _fences = walk.flush()
+        self.assertEqual(len(passes), 1)
+
+    def test_fences_aggregate_by_kind_and_queue(self) -> None:
+        walk = self._walk()
+        walk.event(gpu.SIGNAL_FENCE_EVENT, {"QueueId": 0, "CPUTimestamp": 1000, "Value": 1})
+        walk.event(gpu.WAIT_FENCE_EVENT,
+                   {"QueueId": 2, "CPUTimestamp": 1500, "QueueToWaitForId": 0, "Value": 1})
+        walk.event(gpu.WAIT_FENCE_EVENT,
+                   {"QueueId": 2, "CPUTimestamp": 2500, "QueueToWaitForId": 0, "Value": 2})
+        _queues, _spans, _passes, fences = walk.flush()
+        by_key = {(row["kind"], row["queue"], row["other"]): row["count"] for row in fences}
+        self.assertEqual(by_key[("signal", 0, 0)], 1)
+        self.assertEqual(by_key[("wait", 2, 0)], 2)
+
+    def test_past_the_span_cap_the_union_is_overstated_and_counted(self) -> None:
+        walk = self._walk()
+        for index in range(gpu.QUEUE_SPAN_KEEP + 50):
+            begin = index * 10
+            self._work(walk, 0, begin)
+            self._end(walk, 0, begin + 5)
+        queues, spans, _passes, _fences = walk.flush()
+        self.assertLessEqual(len(spans), gpu.QUEUE_SPAN_KEEP)
+        self.assertGreater(walk.counts["gpu_spans_coarsened"], 0)
+        # the union total is overstated by the folded tail: every 5 us span kept is disjoint, so
+        # the kept intervals' sum is at least the cap's worth
+        self.assertGreater(int(queues[0]["busy_us"]), 0)
+
+    def test_absent_fields_are_refused_not_guessed(self) -> None:
+        walk = self._walk()
+        walk.event(gpu.BEGIN_WORK_EVENT, {"QueueId": 0})
+        walk.event(gpu.END_WORK_EVENT, {"QueueId": 0})
+        walk.event(gpu.WAIT_EVENT, {"QueueId": 0, "StartTime": 1})
+        walk.event(gpu.FRAME_BOUNDARY_EVENT, {"QueueId": 0})
+        walk.event(gpu.STATS_EVENT, {"QueueId": 0})
+        walk.event(gpu.BEGIN_BREADCRUMB_EVENT, {"QueueId": 0, "GPUTimestampTOP": 5})
+        walk.event(gpu.END_BREADCRUMB_EVENT, {"QueueId": 0})
+        walk.event(gpu.SIGNAL_FENCE_EVENT, {})
+        walk.event(gpu.WAIT_FENCE_EVENT, {"QueueId": 0})
+        self.assertEqual(walk.counts["gpu_queue_events"], 9, "counted, every one")
+        queues, _spans, _passes, fences = walk.flush()
+        self.assertEqual(len(queues), 1, "the queue exists -- a stats event addressed it")
+        row = queues[0]
+        self.assertEqual((row["busy_us"], row["wait_us"], row["submits"], row["draws"],
+                          row["boundaries"], row["last_frame"], row["work_spans"],
+                          row["wait_spans"]), (0, 0, 0, 0, 0, 0, 0, 0))
+        self.assertEqual(fences, [], "a fence wait that names no queue is not invented")
+
+
+class TestTheUnion(unittest.TestCase):
+    """`_union` and `union_total`: the interval arithmetic the queue totals stand on."""
+
+    def test_touching_and_nested_intervals_merge(self) -> None:
+        merged = gpu._union([(0, 10), (10, 20), (5, 8), (30, 40)])
+        self.assertEqual(merged, [(0, 20), (30, 40)])
+
+    def test_an_empty_list_is_an_empty_union(self) -> None:
+        self.assertEqual(gpu._union([]), [])
+
+    def test_union_total_filters_by_queue_and_kind(self) -> None:
+        spans = [
+            {"queue": 0, "kind": "work", "begin_us": 0, "end_us": 10},
+            {"queue": 0, "kind": "wait", "begin_us": 0, "end_us": 10},
+            {"queue": 2, "kind": "work", "begin_us": 0, "end_us": 10},
+        ]
+        self.assertEqual(gpu.union_total(spans, 0, "work"), 10)
+        self.assertEqual(gpu.union_total(spans, 0, "wait"), 10)
+        self.assertEqual(gpu.union_total(spans, 2, "work"), 10)
+        self.assertEqual(gpu.union_total(spans, 2, "wait"), 0)
 
 
 if __name__ == "__main__":

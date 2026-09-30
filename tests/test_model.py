@@ -124,7 +124,11 @@ def _importants() -> bytes:
                            + important_aux_block(1, b"Tick")
                            + important_aux_block(2, b"Game.cpp"))
         + important_record(24, pack("u64", 77) + pack("i32", 12)
-                           + important_aux_block(2, b"LoadMap") + important_aux_block(3, b"Maps.cpp"))
+                           # FormatString is a declared WideString: the engine's wide important
+                           # writer memcpy's the UTF-16 (measured against `ImportantLogScope.inl`
+                           # and real captures, 2026-09-30 -- the old one-byte decode mangled it)
+                           + important_aux_block(2, "LoadMap".encode("utf-16-le"))
+                           + important_aux_block(3, b"Maps.cpp"))
         + important_record(26, pack("u16", 1) + pack("u8", 0) + pack("u8", 0)
                            + important_aux_block(3, b"FPS"))
         + important_record(27, pack("u32", 0) + important_aux_block(1, b"Game"))

@@ -42,6 +42,7 @@ PINNED_COMMANDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("verify", ()),
     ("summary", ("--budget", "60")),
     ("bottleneck", ("--budget", "60")),
+    ("gpu", ()),
     ("parallelism", ("--budget", "60")),
     ("sources", ("--budget", "60", "--limit", "12")),
     ("advice", ("--budget", "60")),

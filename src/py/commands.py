@@ -36,6 +36,7 @@ import engine
 import lz4
 import model
 import parallel
+import queues
 import schema
 import sources
 import summary
@@ -66,6 +67,8 @@ _VALUE_OPTIONS = frozenset((
     "format", "limit", "tid", "filter", "jobs", "engine-dir",
     # the summary layer: a budget in either of the two spellings the practice uses
     "budget", "budget-ms",
+    # the gpu command's table choice
+    "table",
     # and `advice`'s rule filter: a comma-separated list of rule ids to drop
     "skip",
     # and `compare`'s gate, its saved baseline, and the file to save one to
@@ -1166,6 +1169,65 @@ def cmd_bottleneck(capture: str, args: List[str]) -> int:
     return 0
 
 
+def cmd_gpu(capture: str, args: List[str]) -> int:
+    """`gpu <capture> [--table queues|passes|frames] [--tid N] [--limit N]`: the GPU channel.
+
+    The GPU's own answer, in whichever shape the capture carries it (REFERENCE §19). The *current*
+    channel is the per-event one: per-queue timelines (busy and wait unions, submit-to-start lag,
+    draw counts), the named passes the breadcrumbs give, and the per-frame GPU busy placed on the
+    frame series -- one clock with the CPU's, and the placement is checked, not assumed. A capture
+    with the *legacy* channel instead gets its state named here and its verdicts in `bottleneck`,
+    which is where the frame-level half already lives.
+
+    Tables: `queues` (the default) is one row per queue; `passes` is the breadcrumb drill-down;
+    `frames` is the judged frame series with the GPU time inside each frame (worst first). Exit
+    codes: 0 reported, 2 the capture carries no GPU data at all (the re-record line, never an
+    empty answer) or the frames table has no placement to show, 1 a failure.
+    """
+    options = parse_options(args)
+    if options.values.keys() - {"table", "tid", "limit", "format", "jobs"} or options.flags:
+        raise UsageError("gpu takes --table queues|passes|frames, --tid, --limit, --format "
+                         "and --jobs")
+    table = options.values.get("table", "queues")
+    if table not in queues.TABLES:
+        raise UsageError("--table is one of %s, got %r" % ("|".join(queues.TABLES), table))
+    limit = options.number("limit", _DEFAULT_BREAKER_LIMIT * 2)
+    tid = options.number("tid", -1)
+    view, model, _cached = load_model(capture, _jobs(options))
+    series = bottleneck.pick_series(model, None if tid < 0 else tid)
+    report = queues.report_of(model, series)
+    lines: List[str] = []
+    lines.append("capture   : %s" % (view.path.name,))
+    if not report.has_queue_data and not report.legacy_frames:
+        lines.append("gpu       : none -- this capture carries no GpuProfiler events in either "
+                     "channel shape")
+        lines.append("hint      : re-record with `-trace=%s`; the gpu channel is in the engine's "
+                     "Default preset" % (channels.DEFAULT_TRACE,))
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        return 2
+    lines.extend(queues.prose_lines(report))
+    if table == "frames" and report.frames is None:
+        lines.append("hint      : the frames table needs frame pairs, a cycle frequency and a "
+                     "placement that holds (see the notes above)")
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        return 2
+    headers = {
+        "queues": queues.QUEUE_TABLE_HEADERS,
+        "passes": queues.PASS_TABLE_HEADERS,
+        "frames": queues.FRAME_TABLE_HEADERS,
+    }[table]
+    right = {
+        "queues": (False, True, True, True, False, True, True, True, True, True, True, True,
+                   True, True),
+        "passes": (False, True, True, True, True),
+        "frames": (True, True, True, True, True),
+    }[table]
+    render_rows(headers, queues.table_rows(report, table, limit), right, options.fmt(), lines)
+    return 0
+
+
 def cmd_tasks(capture: str, args: List[str]) -> int:
     """`tasks <capture> [--limit N] [--graph dot|mermaid|json]`: the task graph and its longest chain.
 
@@ -1487,6 +1549,16 @@ def cmd_verify(capture: str, args: List[str]) -> int:
             "record(s), %d batch(es) that did not read cleanly)" % (
                 counts.get("gpu_frames", 0), counts.get("gpu_events", 0),
                 counts.get("gpu_unreadable", 0),
+            )
+        )
+    if counts.get("gpu_queue_events"):
+        lines.append(
+            "gpu queues: %d event(s) over %d queue(s) (%d work / %d wait span(s), %d unpaired, "
+            "%d negative, %d zero-timestamp, %d out-of-order)" % (
+                counts.get("gpu_queue_events", 0), len(model.get("gpu_queues", [])),
+                counts.get("gpu_work_spans", 0), counts.get("gpu_wait_spans", 0),
+                counts.get("gpu_work_unpaired", 0), counts.get("gpu_negative_durations", 0),
+                counts.get("gpu_zero_timestamps", 0), counts.get("gpu_out_of_order", 0),
             )
         )
     if serial_carried and missing:

@@ -19,7 +19,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import re
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, cast
 
 import coverage
 import decode
@@ -39,8 +39,13 @@ from shapes import (
     FrameOccupancyRow,
     FrameRow,
     FrameWorkRow,
+    GpuBreadcrumbSpecRow,
+    GpuFenceRow,
     GpuFrameRow,
+    GpuPassRow,
+    GpuQueueRow,
     GpuSpecRow,
+    GpuSpanRow,
     RawEvent,
     TID_EVENTS,
     TID_IMPORTANTS,
@@ -132,6 +137,23 @@ _COUNTS_KEYS = (
     "gpu_events",
     "gpu_unreadable",
     "gpu_specs",
+    # the current GPU channel (REFERENCE §19): the queue timelines' events and what could not be
+    # read cleanly -- counted, never dropped silently
+    "gpu_queue_specs",
+    "gpu_queue_events",
+    "gpu_work_spans",
+    "gpu_wait_spans",
+    "gpu_work_unpaired",
+    "gpu_negative_durations",
+    "gpu_zero_timestamps",
+    "gpu_out_of_order",
+    "gpu_frame_boundaries",
+    "gpu_stats_events",
+    "gpu_fence_events",
+    "gpu_breadcrumb_specs",
+    "gpu_breadcrumb_no_spec",
+    "gpu_spans_coarsened",
+    "gpu_passes_dropped",
     # the task channel: the events themselves (the graph is built once, after the merge)
     "task_events",
     # the coverage timelines: the outermost spans kept per thread, and the spans a per-thread cap had
@@ -160,6 +182,9 @@ class SessionInfo(TypedDict, total=False):
     target: str
     last_cycle: int
     duration_cycles: int
+    #: The current GPU channel's `GpuProfiler.Init.Version`, when the capture recorded one (0 when
+    #: it did not -- the legacy channel has no Init event, and neither shape is a zero of the other).
+    gpu_channel_version: int
 
 
 class ChannelRow(TypedDict):
@@ -199,6 +224,13 @@ class SessionModel(TypedDict):
     frame_occupancy: List[FrameOccupancyRow]
     gpu_specs: List[GpuSpecRow]
     gpu_frames: List[GpuFrameRow]
+    #: The current GPU channel (REFERENCE §19): queues and their union totals, the kept spans,
+    #: the named passes and the spec table their names resolve through, and the fences.
+    gpu_queues: List[GpuQueueRow]
+    gpu_spans: List[GpuSpanRow]
+    gpu_passes: List[GpuPassRow]
+    gpu_breadcrumb_specs: List[GpuBreadcrumbSpecRow]
+    gpu_fences: List[GpuFenceRow]
     tasks: List[TaskRow]
     task_edges: List[Tuple[int, int]]
     task_path: List[TaskStepRow]
@@ -253,16 +285,18 @@ def _important_values(
 ) -> Dict[str, object]:
     """Values of an important record: fixed part + the aux blocks inside it.
 
-    `wide_as_bytes` is the important writer's own rule: a wide string there is
-    one byte per character (`FImportantLogScope::FFieldSet<WIDECHAR>` truncates
-    each character), not UTF-16.
+    Strings decode by their declared type (`decode.event_values`): a field the
+    capture declared `WideString` arrives as UTF-16, one declared `AnsiString`
+    as one byte per character -- which is what the CPU profiler's spec names
+    (wide literals into AnsiString fields) actually are. Decoding every
+    important string one byte per character mangled the genuinely wide ones
+    (`Diagnostics.Session2`'s `BuildVersion`, `Misc.BookmarkSpec`'s format
+    string), found 2026-09-30 against two real captures.
     """
     end = offset + size
     fixed_end = min(offset + int(row["size"]), end)
     aux = events.walk_record_aux(stream, fixed_end, end)
-    return decode.event_values(
-        row, stream, RawEvent(uid, None, offset, size, aux, False), wide_as_bytes=True
-    )
+    return decode.event_values(row, stream, RawEvent(uid, None, offset, size, aux, False))
 
 
 #: Below this many decoded stream bytes a build is one process's work: the pool's start-up costs
@@ -304,6 +338,10 @@ class ThreadShare(TypedDict):
     #: how many spans of this thread's timeline the per-thread cap had to merge (`coverage.SPAN_KEEP`)
     spans_coarsened: int
     gpu_frames: List[GpuFrameRow]
+    gpu_queues: List[GpuQueueRow]
+    gpu_spans: List[GpuSpanRow]
+    gpu_passes: List[GpuPassRow]
+    gpu_fences: List[GpuFenceRow]
     task_events: List[TaskEventRow]
     bookmarks: List[BookmarkRow]
 
@@ -320,6 +358,10 @@ class ModelAcc(TypedDict):
     frames: List[FrameRow]
     frame_work: List[FrameWorkRow]
     gpu_frames: List[GpuFrameRow]
+    gpu_queues: List[GpuQueueRow]
+    gpu_spans: List[GpuSpanRow]
+    gpu_passes: List[GpuPassRow]
+    gpu_fences: List[GpuFenceRow]
     task_events: List[TaskEventRow]
     bookmarks: List[BookmarkRow]
 
@@ -518,6 +560,7 @@ def _walk_tid(
     anomalies: List[Anomaly] = []
     bookmarks: List[BookmarkRow] = []
     gpu_frames: List[GpuFrameRow] = []
+    gpu_walk = gpu.QueueWalk(counts)
     task_events: List[TaskEventRow] = []
     windows = _pair_windows(stream, tid, registry, counts)
     occupancy_on = specs is not None
@@ -861,6 +904,11 @@ def _walk_tid(
             if int(gpu_row["unbalanced"]) or int(gpu_row["truncated"]):
                 counts["gpu_unreadable"] += 1
             gpu_frames.append(gpu_row)
+        elif full_name in gpu.QUEUE_EVENTS:
+            # the current GPU channel: one event per GPU work item, dispatched by name (REFERENCE
+            # §19). Everything it counts lands in `counts` and the share's rows, so `--jobs` folds
+            # it in the same ascending-tid order the serial walk produced.
+            gpu_walk.event(full_name, decode.event_values(row, stream, event))
 
     while cursor < window_count:
         if active == cursor:
@@ -879,13 +927,15 @@ def _walk_tid(
     frame_rows = [window.frame_row(tid, occupancy_on) for window in windows]
     frame_work = [window.work_row(tid, _FRAME_WORK_TOP) for window in windows
                   if window.totals is not None]
+    gpu_queues, gpu_spans, gpu_passes, gpu_fences = gpu_walk.flush()
 
     return ThreadShare(
         tid=tid, row=trow, counts=counts, uid_counts=uid_counts, counter_values=counter_values,
         region_counts=region_counts, anomalies=anomalies, frames=frame_rows, frame_work=frame_work,
         spans=coverage.pack(busy), wait_spans=coverage.pack(waits), lock_spans=coverage.pack(locks),
         spans_coarsened=coarsened,
-        gpu_frames=gpu_frames, task_events=task_events, bookmarks=bookmarks,
+        gpu_frames=gpu_frames, gpu_queues=gpu_queues, gpu_spans=gpu_spans, gpu_passes=gpu_passes,
+        gpu_fences=gpu_fences, task_events=task_events, bookmarks=bookmarks,
     )
 
 
@@ -924,8 +974,87 @@ def _merge_share(acc: "ModelAcc", share: ThreadShare) -> None:
     acc["frames"].extend(share["frames"])
     acc["frame_work"].extend(share["frame_work"])
     acc["gpu_frames"].extend(share["gpu_frames"])
+    acc["gpu_queues"].extend(share["gpu_queues"])
+    acc["gpu_spans"].extend(share["gpu_spans"])
+    acc["gpu_passes"].extend(share["gpu_passes"])
+    acc["gpu_fences"].extend(share["gpu_fences"])
     acc["task_events"].extend(share["task_events"])
     acc["bookmarks"].extend(share["bookmarks"])
+
+
+def _merge_gpu_queues(rows: Sequence[GpuQueueRow], spans: Sequence[GpuSpanRow],
+                      specs: Dict[int, GpuQueueRow]) -> List[GpuQueueRow]:
+    """One row per queue id: additive counters summed, union totals recomputed from the spans.
+
+    The queue's declaration (`GpuProfiler.QueueSpec`, an important record) seeds the row -- it is
+    where the capture's own name for the queue lives -- and a queue's events can in principle
+    arrive on more than one thread, so the shares' rows are re-merged here rather than trusted.
+    The union totals are always recomputed from the kept spans (`gpu.union_total`), which is what
+    keeps a row's `busy_us` and the spans a frame placement reads from ever disagreeing.
+    """
+    merged: Dict[int, GpuQueueRow] = {
+        queue_id: cast(GpuQueueRow, dict(row)) for queue_id, row in specs.items()
+    }
+    for row in rows:
+        existing = merged.get(int(row["id"]))
+        if existing is None:
+            merged[int(row["id"])] = cast(GpuQueueRow, dict(row))
+            continue
+        existing["boundaries"] += row["boundaries"]
+        existing["work_spans"] += row["work_spans"]
+        existing["wait_spans"] += row["wait_spans"]
+        existing["submits"] += row["submits"]
+        existing["lag_total_us"] += row["lag_total_us"]
+        existing["lag_negative"] += row["lag_negative"]
+        existing["lag_max_us"] = max(int(existing["lag_max_us"]), int(row["lag_max_us"]))
+        existing["draws"] += row["draws"]
+        existing["primitives"] += row["primitives"]
+        existing["last_frame"] = max(int(existing["last_frame"]), int(row["last_frame"]))
+        if not existing["name"] and row["name"]:
+            existing["name"] = row["name"]
+    for queue_id, row in merged.items():
+        row["busy_us"] = gpu.union_total(spans, queue_id, "work")
+        row["wait_us"] = gpu.union_total(spans, queue_id, "wait")
+    return [merged[queue_id] for queue_id in sorted(merged)]
+
+
+def _merge_gpu_passes(rows: Sequence[GpuPassRow], counts: Dict[str, int]) -> List[GpuPassRow]:
+    """Pass aggregates re-merged across shares, then capped (`gpu.QUEUE_PASS_KEEP`) by inclusive time.
+
+    The cap counts what it folded away (`gpu_passes_dropped`): the passes kept are the report's
+    table, and the dropped ones are named as a number, never as a silence.
+    """
+    merged: Dict[int, GpuPassRow] = {}
+    for row in rows:
+        spec = int(row["spec"])
+        existing = merged.get(spec)
+        if existing is None:
+            merged[spec] = cast(GpuPassRow, dict(row))
+            continue
+        existing["calls"] += row["calls"]
+        existing["inclusive_us"] += row["inclusive_us"]
+        if int(row["max_us"]) > int(existing["max_us"]):
+            existing["max_us"] = row["max_us"]
+            existing["max_begin_us"] = row["max_begin_us"]
+            existing["max_end_us"] = row["max_end_us"]
+    ordered = sorted(merged.values(), key=lambda row: (-int(row["inclusive_us"]), int(row["spec"])))
+    if len(ordered) > gpu.QUEUE_PASS_KEEP:
+        counts["gpu_passes_dropped"] += len(ordered) - gpu.QUEUE_PASS_KEEP
+        ordered = ordered[:gpu.QUEUE_PASS_KEEP]
+    return ordered
+
+
+def _merge_gpu_fences(rows: Sequence[GpuFenceRow]) -> List[GpuFenceRow]:
+    """Fence lines merged by (kind, queue, other): the same aggregation the counters take."""
+    merged: Dict[Tuple[str, int, int], GpuFenceRow] = {}
+    for row in rows:
+        key = (str(row["kind"]), int(row["queue"]), int(row["other"]))
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = cast(GpuFenceRow, dict(row))
+        else:
+            existing["count"] += row["count"]
+    return [merged[key] for key in sorted(merged)]
 
 
 def _spec_kinds(timers: Dict[int, TimerRow]) -> Optional[bytes]:
@@ -1080,6 +1209,8 @@ def build_model(
     threads: Dict[int, ThreadRow] = {}
     timers: Dict[int, TimerRow] = {}
     gpu_specs: Dict[int, GpuSpecRow] = {}
+    gpu_queues: Dict[int, GpuQueueRow] = {}
+    breadcrumb_specs: Dict[int, GpuBreadcrumbSpecRow] = {}
     bookmark_specs: Dict[int, Tuple[str, str, int]] = {}
     counters: Dict[int, CounterSpecRow] = {}
     csv_categories: Dict[str, str] = {}
@@ -1148,6 +1279,22 @@ def build_model(
             if gpu_spec is not None:
                 gpu_specs[gpu_spec["id"]] = gpu_spec
                 counts["gpu_specs"] += 1
+        elif full_name == gpu.QUEUE_SPEC_EVENT:
+            # the current channel's queue declarations: last declaration of an id wins, like the
+            # legacy spec table above
+            queue_spec = gpu.queue_spec(values)
+            if queue_spec is not None:
+                gpu_queues[queue_spec["id"]] = queue_spec
+                counts["gpu_queue_specs"] += 1
+        elif full_name == gpu.BREADCRUMB_SPEC_EVENT:
+            crumb_spec = gpu.breadcrumb_spec(values)
+            if crumb_spec is not None:
+                breadcrumb_specs[crumb_spec["spec"]] = crumb_spec
+                counts["gpu_breadcrumb_specs"] += 1
+        elif full_name == gpu.INIT_EVENT:
+            version = decode.value_int(values, "Version")
+            if version is not None:
+                session["gpu_channel_version"] = version
         elif full_name == "Misc.BookmarkSpec":
             point = decode.value_int(values, "BookmarkPoint")
             if point is not None:
@@ -1210,6 +1357,10 @@ def build_model(
     frame_rows: List[FrameRow] = []
     frame_work: List[FrameWorkRow] = []
     gpu_frames: List[GpuFrameRow] = []
+    gpu_queue_rows: List[GpuQueueRow] = []
+    gpu_span_rows: List[GpuSpanRow] = []
+    gpu_pass_rows: List[GpuPassRow] = []
+    gpu_fence_rows: List[GpuFenceRow] = []
     task_events: List[TaskEventRow] = []
     bookmarks: List[BookmarkRow] = []
     units = [
@@ -1240,13 +1391,16 @@ def build_model(
         frames=frame_rows,
         frame_work=frame_work,
         gpu_frames=gpu_frames,
+        gpu_queues=gpu_queue_rows,
+        gpu_spans=gpu_span_rows,
+        gpu_passes=gpu_pass_rows,
+        gpu_fences=gpu_fence_rows,
         task_events=task_events,
         bookmarks=bookmarks,
     )
     for share in shares:
         thread(share["tid"])
         _merge_share(acc, share)
-
 
     frame_rows.sort(key=lambda row: (int(row["begin_cycle"]), int(row["type"]), int(row["tid"])))
     for index, row in enumerate(frame_rows):
@@ -1255,6 +1409,14 @@ def build_model(
         int(row["begin_cycle"]), int(row["tid"]), int(row["type"]),
     ))
     bookmarks.sort(key=lambda row: (int(row["cycle"]), int(row["point"])))
+
+    # -- the current GPU channel: one row per queue (a queue's events can in principle arrive on
+    # more than one thread, so its totals are re-merged here from the rows and the kept spans),
+    # passes re-aggregated and capped, spans in placement order
+    gpu_queue_merged = _merge_gpu_queues(gpu_queue_rows, gpu_span_rows, gpu_queues)
+    gpu_pass_merged = _merge_gpu_passes(gpu_pass_rows, counts)
+    gpu_span_rows.sort(key=lambda row: (int(row["queue"]), int(row["begin_us"]), str(row["kind"])))
+    gpu_fence_merged = _merge_gpu_fences(gpu_fence_rows)
 
     # -- what every thread did inside every frame: the timelines the walks measured, folded into the
     # capture's own frame windows. Here, once, because a worker pool has no frames of its own and a
@@ -1321,6 +1483,11 @@ def build_model(
         gpu_frames=sorted(gpu_frames, key=lambda row: (
             int(row["base_us"]), int(row["number"]), int(row["tid"]),
         )),
+        gpu_queues=gpu_queue_merged,
+        gpu_spans=gpu_span_rows,
+        gpu_passes=gpu_pass_merged,
+        gpu_breadcrumb_specs=[breadcrumb_specs[spec] for spec in sorted(breadcrumb_specs)],
+        gpu_fences=gpu_fence_merged,
         tasks=kept_tasks,
         task_edges=tasks.edges_between(task_edges, [task["id"] for task in kept_tasks],
                                        tasks.EDGE_KEEP),

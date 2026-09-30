@@ -65,7 +65,8 @@ per-frame batches) → `container` (header + packet walk) → `streams` (per-thr
 (values + the batch format) → `coverage` (cycle-interval arithmetic, and the per-frame occupancy
 measurement every thread's timeline is folded into) → `model` (the session model, incl. the
 per-frame work attribution, the occupancy and the coverage timelines) → `summary` (the budget,
-percentiles and histograms a frame-time report is defined by) → `bottleneck` (the classification
+percentiles and histograms a frame-time report is defined by) → `queues` (the GPU channel's
+per-queue timelines and passes, placed on the frame series) → `bottleneck` (the classification
 on top of them: what bounds a frame) → `parallel` (the same measurements, asked who worked: solo
 work, simultaneity, contention) → `calltree` (the nesting tree and **self** time, built from the
 pairs in a second pass over one thread) → `sources` (the spec table's file:line, mapped into engine vs
@@ -152,7 +153,7 @@ without `gpu` cannot answer a GPU question, one without `memtag`/`memalloc` cann
 question, and one without `task` cannot show a critical path. An analysis whose channel is missing
 reports **skipped** with the re-record line, never zero, never a default and never a guess — the
 same rule as the corpus half's exit 2, one level down. Every analysis that lands says in its tests
-what it does with its channel absent, and `coverage` (ROADMAP §1) is the one command that has to
+what it does with its channel absent, and `coverage` (REFERENCE §18) is the one command that has to
 get this right for all of them at once.
 
 ## Parallel work (the one place processes are used)

@@ -6,9 +6,11 @@ The question the practice decides *before* drilling anywhere, answered from what
   split into work and wait (`FrameRow.covered_cycles`/`wait_cycles`);
 * **the capture's other frame series**, matched by the windows they overlap (a game frame and the
   render frame that runs beside it are one frame of the pipeline, and their frames overlap);
-* **the GPU**, when the capture carries the legacy `GpuProfiler` channel: the microseconds the GPU
-  spent executing traced work per rendered frame (`GpuFrameRow.busy_us`), placed on the frame series
-  by a measured clock scale.
+* **the GPU**, when the capture carries GPU data in either channel shape: the legacy channel's
+  per-rendered-frame busy microseconds (`GpuFrameRow.busy_us`, placed by a measured clock scale),
+  or the *current* channel's queue timeline (`queues.align`, one clock with the CPU's, checked for
+  fit -- REFERENCE §19). The legacy frames win when both are present; the report says which
+  answered.
 
 The decision tree is the engine's own, mirrored rather than invented
 (`Engine/Private/ChartCreation.cpp:1325-1349`: *"if frame time is greater than our target then we are
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, cast
 
+import queues
 from shapes import FrameRow
 from summary import Budget, frame_work_of, series_of, Series, times_ms, work_text
 
@@ -291,13 +294,27 @@ def classify(model: Mapping[str, Any], budget: Budget,
         return None, ["the capture declared no CpuProfiler timer specs, so no frame's occupancy "
                       "was measured and nothing here could be attributed"]
     matched = match_series(model, series)
-    gpu_present = bool([row for row in model.get("gpu_frames", []) if isinstance(row, dict)])
+    legacy_frames = [row for row in model.get("gpu_frames", []) if isinstance(row, dict)]
+    queue_work = [row for row in model.get("gpu_spans", []) if isinstance(row, dict)
+                  and str(row.get("kind")) == "work"]
+    gpu_present = bool(legacy_frames) or bool(queue_work)
     alignment, gpu_ms = align_gpu(model, series, frequency)
+    placement: Optional[queues.Placement] = None
+    if alignment is None and queue_work:
+        # the legacy channel answered nothing (absent, or unplaced): the current channel's queue
+        # timeline is the other way a GPU verdict can be reached (REFERENCE §19). The map keeps the
+        # legacy shape -- frame id -> {GPU frame number: ms} -- with -1 standing in for "the queue
+        # spans", which is no legacy frame number and so names no pass evidence.
+        placement = queues.align(model, series, frequency)
+        if placement is not None:
+            gpu_ms = {key: {-1: us / 1000.0} for key, us in placement.work_us.items()}
     if not gpu_present:
         notes.append("no GPU frames in this capture: the GPU side is unknown here, so a CPU "
                      "verdict is not a bound on its own (re-record with the gpu channel)")
+    elif placement is not None:
+        notes.append("GPU timeline: %s" % (placement.describe(),))
     elif alignment is None:
-        notes.append("the capture carries GPU frames but their timeline could not be placed on "
+        notes.append("the capture carries GPU data but its timeline could not be placed on "
                      "this frame series: the GPU side is unknown here")
     else:
         notes.append("GPU timeline: %s" % (alignment.describe(),))

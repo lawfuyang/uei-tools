@@ -25,6 +25,12 @@ Commands:
                               the budget, with the evidence and the reasons it cannot
                               decide (--budget, --budget-ms, --tid, --limit; exit 2 when
                               the capture has no frames, no cycle frequency or no scopes)
+  gpu <capture>               the GPU channel's own answer, in whichever shape the capture
+                              carries it: per-queue timelines (busy and wait unions, the
+                              submit-to-start lag, draw counts), the breadcrumb passes,
+                              and the per-frame GPU busy on the frame series
+                              (--table queues|passes|frames, --tid N, --limit N; exit 2
+                              when the capture carries no GPU data at all)
   summary <capture>           the frame-time distribution against a budget, and the
                               frames that break it with the timers that ran in them
                               (--budget FPS | --budget-ms MS, default 60 FPS; --tid N
@@ -140,6 +146,7 @@ from commands import (
     cmd_cache,
     cmd_csv,
     cmd_frames,
+    cmd_gpu,
     cmd_info,
     cmd_lz4,
     cmd_packets,
@@ -170,6 +177,7 @@ _CAPTURE_COMMANDS = {
     "bottleneck": cmd_bottleneck,
     "compare": cmd_compare,
     "coverage": cmd_coverage,
+    "gpu": cmd_gpu,
     "summary": cmd_summary,
     "self": cmd_self,
     "parallelism": cmd_parallelism,

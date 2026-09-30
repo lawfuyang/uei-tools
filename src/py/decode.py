@@ -51,9 +51,7 @@ def decode_string(stream: bytes, offset: int, size: int, wide: bool) -> str:
     return data.decode("utf-8", "replace").rstrip("\x00")
 
 
-def event_values(
-    row: EventTypeRow, stream: bytes, event: RawEvent, wide_as_bytes: bool = False
-) -> Dict[str, object]:
+def event_values(row: EventTypeRow, stream: bytes, event: RawEvent) -> Dict[str, object]:
     """Every regular field of one event, named, out of payload and aux blocks.
 
     Strings and arrays come from the aux blocks the walker recorded, matched by
@@ -63,6 +61,16 @@ def event_values(
     last one alone is a truncated value, which is how a batch blob loses its
     final varint. Fixed values are read at the descriptor's offset; the
     reference and definition-id families are not interpreted here.
+
+    A string decodes by its **declared** type, not by what it contains: a field
+    declared `WideString` was written by the wide writer (`FFieldSet<…,
+    WideString>::Impl` memcpy's the UTF-16), and one declared `AnsiString` by
+    the narrow writer -- whose wide overload truncates each character to its
+    low byte, which is how the CPU profiler's spec names (wide literals into
+    AnsiString fields) arrive. Measured 2026-09-30 against this checkout's
+    `ImportantLogScope.inl` and two real captures: decoding a WideString field
+    one byte per character mangles it (`UE5-CL-0` reads `U\\x00E\\x005\\x00...`),
+    which is what the removed `wide_as_bytes` flag did to every wide field.
     """
     values: Dict[str, object] = {}
     segments: Dict[int, List[Tuple[int, int, int]]] = {}
@@ -76,8 +84,7 @@ def event_values(
             blocks = segments.get(int(field["index"]))
             if not blocks:
                 continue
-            # an important record writes a "wide" string one byte per character
-            wide = (type_byte & 0x03) != 0 and not wide_as_bytes
+            wide = (type_byte & 0x03) != 0
             if len(blocks) == 1:
                 values[field["name"]] = decode_string(stream, blocks[0][1], blocks[0][2], wide)
             else:
